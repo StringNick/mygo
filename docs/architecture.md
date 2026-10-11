@@ -1362,7 +1362,9 @@ either.
   showing it (`RefreshRate`: the screen's `maximumFramesPerSecond`, GDK's
   `gdk_monitor_get_refresh_rate`, the display mode's frequency from
   `EnumDisplaySettingsW`); asks for a frame (`RequestFrame`: a
-  paused `CADisplayLink`, before macOS 14 an `NSTimer` at the display's
+  paused `CADisplayLink`, whose ticks draw frames that follow each other
+  themselves while a frame after a pause, or after a resize, draws when
+  AppKit displays the view, before macOS 14 an `NSTimer` at the display's
   rate, `gtk_widget_queue_draw` or a tick callback of GTK's frame clock,
   `InvalidateRect`); presents
   pixels drawn on the CPU (`PresentPixels`: a CGImage as the layer's
@@ -1570,15 +1572,24 @@ either.
   of animation, so position and velocity survive interruptions (a curve's
   velocity is its easing's slope). A delayed target waits in the channel
   while the old path goes on. `Jump` sets values and derives a velocity
-  from successive ones; presses keep their last moves (`dragTrack`) for
-  `DragVelocity` and `DragEnded`. Keyframe sequences keep one sequence per
+  from successive ones; presses keep their last moves (`dragTrack`), in
+  the element's axes and the window's, for `DragVelocity` and
+  `DragEnded`. Keyframe sequences keep one sequence per
   key with an explicit replay token. All ask for frames only while moving,
   and end at their targets under reduced motion. Poses (`ui/pose.go`,
   `AnimatePose`) are channels sampled as frames commit, into a transform
   after the element's own (`poseM`) and a fade; frames that only paint
   (`repaintFrame`) move the posed elements of the last frame built on
   (`repose`) and set their subtrees' transforms again (`updateWorld`), so
-  they move without the view running. Content transitions (`ui/content.go`)
+  they move without the view running. `Draggable` (`ui/draggable.go`)
+  keeps two channels of an offset (`dragRec`) that `showPose` adds to the
+  pose's translation: as the pointer drags the element, they hold where
+  the press's move in the window (`dragTrack`), mapped into the parent's
+  axes through the inverse of its last world transform, takes the offset
+  from where the press caught it, so they are the same in every build
+  pass of a frame; once let go, a spring starts at the release's velocity
+  for where `Snap` chooses from the projected throw, and goes on in frames
+  that only paint, the view building once more when it comes to rest. Content transitions (`ui/content.go`)
   keep what an element showed, and fade or roll it into what it shows as
   it paints, counting paintings (`engine.paints`) rather than frames
   built, so frames that only paint move them on too.
@@ -2344,12 +2355,21 @@ either.
     source until it has cached it; a library older than `shader.metal`
     falls back to that, and its test fails. It draws into a CAMetalLayer
     it adds to the surface view's layer. The command queue, shaders,
-    sampler and placeholder texture are made on demand. Its frames
-    present with the Core Animation transaction (`presentsWithTransaction`), so a live resize
-    shows no stretched frames, and each frame waits for the GPU to finish
-    the last before it updates the textures and the instance buffer the
-    last read, so two drawables do rather than the three a layer makes
-    while a window animates. Two seconds after the last frame, as the
+    sampler and placeholder texture are made on demand. A frame that
+    changes the layer (its size, scale or pixel format), or shows web
+    views, which move in the window's transaction, presents with the Core
+    Animation transaction (`presentsWithTransaction`), so a live resize
+    shows no stretched frames; the others present as soon as the GPU has
+    them (`presentDrawable:`), sparing a pass of AppKit's display cycle
+    and a commit of the transaction each: an animation at 120 Hz takes
+    about half the main thread's time it would. A frame presented so
+    that waited for its drawable, as the display held both until its next
+    refresh, has the next skip a refresh (`Behind`, at most once a
+    second), or the frames after would wait as long, most of each
+    refresh, blocking the main thread. Each frame waits for the GPU to
+    finish the last before it updates the textures and the instance
+    buffer the last read, so two drawables do rather than the three a
+    layer makes while a window animates. Two seconds after the last frame, as the
     driver frees its own memory of frames, a timer shrinks the drawables,
     which frees all but the one shown, until the next frame makes them
     again, and releases GPU instance buffers, atlas/image textures and
@@ -2982,5 +3002,5 @@ which npm allows only for packages that exist: the first release uses an
 | native UI surface | layer-backed NSView, frames from `CADisplayLink` (a timer at the display's rate before macOS 14), input methods through NSTextInputClient | GtkGLArea (GtkDrawingArea without a GPU), GtkIMMulticontext | `MyGoSurface` child window, IMM32 |
 | native UI data drags | NSDraggingSession, NSPasteboardItemDataProvider, NSDraggingDestination | GTK drag contexts, MIME selections, text/uri-list | OLE IDataObject, IDropSource, IDropTarget, Shell drag images |
 | native UI accessibility | `NSAccessibilityElement` subclasses | ATK objects (GObject types registered through purego), bridged to AT-SPI by GTK | UI Automation fragments (COM objects; assembly thunks for the methods taking doubles) |
-| native UI rendering | Metal, into a CAMetalLayer presenting with the Core Animation transaction | OpenGL 3.3 or ES 3.0 in the GtkGLArea's render signal; on the CPU, painted with cairo, where OpenGL runs on the CPU | Direct3D 11 (WARP without a GPU), flip-model swap chain |
+| native UI rendering | Metal, into a CAMetalLayer presenting as soon as drawn, or with the Core Animation transaction for frames that resize it or show web views | OpenGL 3.3 or ES 3.0 in the GtkGLArea's render signal; on the CPU, painted with cairo, where OpenGL runs on the CPU | Direct3D 11 (WARP without a GPU), flip-model swap chain |
 | web views in native UI | WKWebView in a clip view under the surface; `hitTest:` lets the pointer through | WebKitWebView in a `GtkLayout` under the area in a `GtkOverlay`; an input shape lets the pointer through | WebView2 composition controller in a DirectComposition target under the frames'; the surface sends it the mouse |
