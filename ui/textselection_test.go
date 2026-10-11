@@ -678,3 +678,63 @@ func TestInputBackgroundPreservesCompositionAndCaret(t *testing.T) {
 		tt.rt.close()
 	}
 }
+
+func TestTransformedSelectionShowsOverSpanBackground(t *testing.T) {
+	highlight, background := RGB(255, 200, 0), RGB(80, 80, 80)
+	var paragraph *node
+	tt := coreNewTester(func(c *context) {
+		coreColumn(c).Selectable().SelectionColor(highlight).Children(func() {
+			paragraph = coreRichText(c, Span{Text: "test.go", Background: background}).Absolute().Top(120).Translate(0, -110)
+		})
+	}, 200, 100)
+	defer tt.rt.close()
+	box := paragraph.Bounds()
+	if selectionPixels(tt, background, box) == 0 {
+		t.Fatal("background outside the layout viewport did not move with the text")
+	}
+	tt.ClickAt(box.X+2, box.Y+box.H/2)
+	tt.Key(Cmd, KeyA)
+	if selectionPixels(tt, highlight, box) == 0 {
+		t.Fatal("span background covers the transformed selection")
+	}
+}
+
+func TestContentTransitionSelectionPaintOrder(t *testing.T) {
+	for _, numeric := range []bool{false, true} {
+		value := "120"
+		highlight, background := RGB(255, 200, 0), RGB(80, 80, 80)
+		tt, now := clockTester(func(c *context) {
+			coreColumn(c).Selectable().SelectionColor(highlight).Children(func() {
+				coreText(c, value).TextBackground(background).ContentTransition(ContentTransition{Numeric: numeric, Animation: &Animation{Duration: 100 * time.Millisecond, Ease: Linear}})
+			})
+		}, 200, 100)
+		value = "130"
+		tt.Frame()
+		*now = now.Add(50 * time.Millisecond)
+		tt.Frame()
+		selectBetween(t, tt, value, 0, value, len(value))
+		if _, faded := paintedGlyphs(tt); faded < 2 {
+			t.Errorf("numeric %v: content transition stopped drawing faded glyphs", numeric)
+		}
+		backgroundAt, selections := -1, 0
+		for i, op := range tt.h.last.Ops {
+			if op.Kind == scene.OpFill && op.Color == background.scene() {
+				backgroundAt = i
+			}
+			if op.Kind != scene.OpFill || op.Color != highlight.scene() {
+				continue
+			}
+			selections++
+			if backgroundAt < 0 || backgroundAt >= i {
+				t.Errorf("numeric %v: selection precedes the text background", numeric)
+			}
+			if i+1 >= len(tt.h.last.Ops) || tt.h.last.Ops[i+1].Kind != scene.OpGlyphs {
+				t.Errorf("numeric %v: selection is not below its glyphs", numeric)
+			}
+		}
+		if selections == 0 {
+			t.Errorf("numeric %v: transition lost the selection", numeric)
+		}
+		tt.rt.close()
+	}
+}
