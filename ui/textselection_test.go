@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/egoist/mygo/internal/platform"
+	"github.com/egoist/mygo/internal/scene"
 )
 
 func selectableAt(t *testing.T, tt *Tester, text string, at int) (float32, float32) {
@@ -556,5 +557,124 @@ func TestSelectionColor(t *testing.T) {
 	selectBetween(t, tt, "Plain", 0, "Plain", 5)
 	if painted("Plain", highlight) || inked("Plain") <= before {
 		t.Error("the plain selection is not the theme's highlight")
+	}
+}
+
+// A text or span background must not hide the selection above it.
+func TestSelectionShowsOverSpanBackground(t *testing.T) {
+	highlight, background := RGB(255, 200, 0), RGB(80, 80, 80)
+	for _, tc := range []struct {
+		name, source string
+		build        func(*context)
+	}{
+		{"plain", "test.go", func(c *context) { coreText(c, "test.go") }},
+		{"text background", "test.go", func(c *context) { coreText(c, "test.go").TextBackground(background) }},
+		{"span background", "test.go", func(c *context) { coreRichText(c, Span{Text: "test.go", Background: background}) }},
+		{"inline background", "test.go", func(c *context) {
+			coreText(c, "").Children(func() { coreText(c, "test.go").Background(background) })
+		}},
+		{"multiple lines and spans", "test.go\nnext.go", func(c *context) {
+			coreRichText(c, Span{Text: "test.go\n", Background: background}, Span{Text: "next.go", Background: RGB(100, 100, 100)}).TextBackground(background).Underline()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tt := coreNewTester(func(c *context) {
+				coreColumn(c).Selectable().SelectionColor(highlight).Padding(20).Children(func() { tc.build(c) })
+			}, 200, 100)
+			defer tt.rt.close()
+			for _, selected := range [][2]int{{1, len(tc.source) - 1}, {0, len(tc.source)}} {
+				selectBetween(t, tt, tc.source, selected[0], tc.source, selected[1])
+				tt.Key(Cmd, KeyC)
+				if got, want := tt.Clipboard(), tc.source[selected[0]:selected[1]]; got != want {
+					t.Fatalf("copied %q, want %q", got, want)
+				}
+				for _, state := range tt.rt.texts {
+					if state.editor.source != tc.source {
+						continue
+					}
+					for li, line := range state.editor.layout.Lines {
+						box := Rect{state.x + state.editor.originX + line.X, state.y + state.editor.originY + line.Y, line.Width, line.Height}
+						if selectionPixels(tt, highlight, box) == 0 {
+							t.Errorf("background covers selection %v on line %d", selected, li)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func selectionPixels(tt *Tester, highlight Color, box Rect) int {
+	img, n := tt.Image(), 0
+	for y := int(box.Y); y < int(box.Y+box.H); y++ {
+		for x := int(box.X); x < int(box.X+box.W); x++ {
+			p := img.RGBAAt(x, y)
+			if p.R == highlight.R && p.G == highlight.G && p.B == highlight.B {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+func TestInputSelectionShowsOverTextBackground(t *testing.T) {
+	highlight, background := RGB(255, 200, 0), RGB(80, 80, 80)
+	for _, multiline := range []bool{false, true} {
+		name, value := "input", "test.go"
+		if multiline {
+			name, value = "area", "test.go"
+		}
+		t.Run(name, func(t *testing.T) {
+			var input *node
+			tt := coreNewTester(func(c *context) {
+				input = textInput(c, &value, multiline).Fill().AutoFocus().TextBackground(background).SelectionColor(highlight)
+			}, 200, 100)
+			defer tt.rt.close()
+			for _, selected := range []TextInputRange{{Start: 1, End: len(value) - 1}, {Start: 0, End: len(value)}} {
+				tt.Key(Cmd, KeyA)
+				tt.Key(0, KeyLeft)
+				for range selected.Start {
+					tt.Key(0, KeyRight)
+				}
+				for range selected.End - selected.Start {
+					tt.Key(Shift, KeyRight)
+				}
+				if n := selectionPixels(tt, highlight, input.contentBox()); n == 0 {
+					t.Errorf("background covers selection %+v", selected)
+				}
+			}
+		})
+	}
+}
+
+// Composition and caret remain above text backgrounds and glyphs.
+func TestInputBackgroundPreservesCompositionAndCaret(t *testing.T) {
+	for _, multiline := range []bool{false, true} {
+		value := "ab"
+		ink, accent := RGB(220, 0, 0), RGB(0, 180, 0)
+		tt := coreNewTester(func(c *context) {
+			c.Theme().Accent = accent
+			textInput(c, &value, multiline).Fill().AutoFocus().TextBackground(RGB(80, 80, 80)).TextColor(ink)
+		}, 200, 100)
+		tt.Compose("xy", 2)
+		glyphs, underline, caret := -1, -1, -1
+		for i, op := range tt.h.last.Ops {
+			if op.Kind == scene.OpGlyphs {
+				glyphs = i
+			}
+			if op.Kind != scene.OpFill {
+				continue
+			}
+			if op.Color == ink.scene() && op.Rect.H == 1 && op.Rect.W > 1 {
+				underline = i
+			}
+			if op.Color == accent.scene() && op.Rect.W == 1 && op.Rect.H > 1 {
+				caret = i
+			}
+		}
+		if glyphs < 0 || underline <= glyphs || caret <= underline {
+			t.Errorf("multiline %v: glyphs %d, composition underline %d, caret %d", multiline, glyphs, underline, caret)
+		}
+		tt.rt.close()
 	}
 }
