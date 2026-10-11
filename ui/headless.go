@@ -28,7 +28,7 @@ type headless struct {
 	opened    []string
 	// escapes counts the Escapes nothing handled.
 	escapes int
-	openErr   error
+	openErr error
 	// later are what the view asked to run after the frame, as a window
 	// posts them to the main thread.
 	later  []func()
