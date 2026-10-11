@@ -97,6 +97,42 @@ func TestShaderLibrary(t *testing.T) {
 	pool(func() { release(&lib) })
 }
 
+// The drawable pool keeps its configured size when idle trimming shrinks
+// the textures and a later frame restores them.
+func TestDrawablePoolAfterIdleTrim(t *testing.T) {
+	if err := load(); err != nil {
+		t.Skip("no Metal:", err)
+	}
+	var layer id
+	pool(func() { layer = send(class("CALayer"), "new") })
+	if layer == 0 {
+		t.Skip("no Core Animation")
+	}
+	defer pool(func() { release(&layer) })
+	r, err := New(uintptr(layer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Release()
+	pool(func() {
+		r.fit(800, 600, 1)
+		if n := send(r.layer, "maximumDrawableCount"); n != 3 {
+			t.Errorf("drawable count = %d, want 3", n)
+		}
+		r.trim()
+		if !r.trimmed {
+			t.Error("idle trim did not shrink the drawables")
+		}
+		r.fit(800, 600, 1)
+		if r.trimmed {
+			t.Error("next frame did not restore the drawables")
+		}
+		if n := send(r.layer, "maximumDrawableCount"); n != 3 {
+			t.Errorf("drawable count after trim = %d, want 3", n)
+		}
+	})
+}
+
 // TestChangedSince checks what frames drawn in memory copy into the
 // drawables, which take turns, and after the GPU drew into one.
 // TestWideColors draws wide colors into a float16 target, which keeps what

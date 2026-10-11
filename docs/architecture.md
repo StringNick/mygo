@@ -2348,9 +2348,12 @@ either.
     present with the Core Animation transaction (`presentsWithTransaction`), so a live resize
     shows no stretched frames, and each frame waits for the GPU to finish
     the last before it updates the textures and the instance buffer the
-    last read, so two drawables do rather than the three a layer makes
-    while a window animates. Two seconds after the last frame, as the
-    driver frees its own memory of frames, a timer shrinks the drawables,
+    last read. The layer allows three drawables so a frame can acquire a
+    spare while Core Animation holds the presented frames, reducing
+    main-thread waits at high refresh rates. This retains one more frame
+    of memory while animating than a two-drawable pool. Two seconds after
+    the last frame, as the driver frees its own memory of frames, a timer
+    shrinks the drawables,
     which frees all but the one shown, until the next frame makes them
     again, and releases GPU instance buffers, atlas/image textures and
     backdrop textures: an idle window keeps one frame of memory. Its

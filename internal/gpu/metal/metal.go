@@ -385,11 +385,11 @@ func New(layer uintptr) (r *Renderer, err error) {
 		// Effects read their backdrops from the drawable, which their
 		// passes sample then.
 		send(ml, "setFramebufferOnly:", 0)
-		// Frames wait for the last to finish, so two drawables do,
-		// rather than the three Core Animation makes otherwise while a
-		// window animates: one less frame of memory.
+		// Keep a spare drawable while Core Animation holds the frames it is
+		// presenting. GPU work still waits for the last frame below; the
+		// extra drawable reduces waiting for presentation at high refresh rates.
 		if respondsTo(ml, "setMaximumDrawableCount:") {
-			send(ml, "setMaximumDrawableCount:", 2)
+			send(ml, "setMaximumDrawableCount:", drawableCount)
 		}
 		// Frames show with the window's other changes, as during a live
 		// resize, instead of a moment after them.
@@ -406,6 +406,9 @@ func New(layer uintptr) (r *Renderer, err error) {
 	}
 	return r, nil
 }
+
+// The extra frame is retained while drawing; idle trim shrinks the pool.
+const drawableCount = 3
 
 // newRenderer creates a renderer without a layer, for New and tests.
 func newRenderer() (r *Renderer, err error) {

@@ -41,3 +41,12 @@ nothing.
 MyGo draws a frame only when something changes: input, `Invalidate`,
 `After`, or an animation that moves. An idle window draws nothing, and two
 seconds after its last frame it frees the frame it drew in memory.
+
+On macOS the Metal layer allows three drawables. A spare reduces the time
+the main thread waits for Core Animation to return a presented frame,
+particularly at high refresh rates. GPU frames still run one at a time
+and present with the Core Animation transaction. The extra drawable
+costs one frame of memory while animating: about 4 bytes per pixel in
+sRGB, or 8 for extended color. Two seconds after drawing stops, the
+renderer shrinks the spare drawables and releases its drawing resources;
+the displayed frame remains until the next frame restores the pool.
