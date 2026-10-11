@@ -246,6 +246,12 @@ func (c *context) rekey(e *node, k any) {
 	}
 	id := keyedID(parent, k)
 	rt := c.rt
+	if id != e.id {
+		// Creation looked up the old identity before Key was called. It
+		// no longer belongs to this element: leave it unseen so pruning
+		// can retire it (and restore focus if it was an overlay).
+		e.st.seen = 0
+	}
 	st, built := rt.lookState(id)
 	if built && id != e.id {
 		// Another element of the pass has the key under the same parent.
