@@ -90,14 +90,17 @@ func (e *node) Transition(t ElementTransition) *node {
 }
 
 // Transitioning reports whether the element's Transition was moving it,
-// or changing its colors, or its pose (AnimatePose) was moving it, in the
-// frame before: false once it is where it goes.
+// or changing its colors, or its pose (AnimatePose) or Draggable was
+// moving it, in the frame before: false once it is where it goes.
 func (e *node) Transitioning() bool {
 	if !e.hasState() {
 		return false
 	}
 	frame := e.c.rt.frame
 	if p := e.st.pose; p != nil && p.frame+1 >= frame && p.moving() {
+		return true
+	}
+	if d := e.st.dragRec; d != nil && d.frame+1 >= frame && d.moving() {
 		return true
 	}
 	r := e.st.trec
@@ -237,6 +240,35 @@ func headFor(ch *channel, to float64, a Animation, now time.Time) {
 	default:
 		ch.pending = false
 		ch.retarget(to, a)
+	}
+}
+
+// follow shifts what moves that the Transition does not animate, as an
+// Enter's place, by as much as the layout moved it since the frame before:
+// that follows the layout at once, as it would without the Enter. A size
+// scales instead, so that one collapsed opens on in proportion, never
+// below nothing as the layout makes it smaller.
+func (r *transition) follow(next tbox, props uint8) {
+	var own uint8
+	if props&propPosition != 0 {
+		own |= movePos
+	}
+	if props&propSize != 0 {
+		own |= moveSize
+	}
+	was, to := r.target.vals(), next.vals()
+	for i := range r.ch {
+		g := groupOf[i]
+		if g&(movePos|moveSize) == 0 || own&g != 0 || r.moving&g == 0 {
+			continue
+		}
+		switch d := to[i] - was[i]; {
+		case d == 0:
+		case g == moveSize && was[i] > 0:
+			r.ch[i].scale(float64(was[i]), float64(to[i]))
+		default:
+			r.ch[i].shift(float64(d))
+		}
 	}
 }
 
@@ -424,6 +456,10 @@ func (rt *engine) animateLayout(root *node, w, h float32) {
 			}
 			if still {
 				changed = 0
+			}
+			if r.laid+1 == rt.frame {
+				// Not back as its copy went: that heads for next already.
+				r.follow(next, props)
 			}
 			if changed != 0 {
 				r.head(next, changed, now)

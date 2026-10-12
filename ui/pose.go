@@ -94,28 +94,71 @@ func (rt *engine) showPose(e *node, r *poseRec) {
 	now := rt.c.now
 	var v [5]float32
 	for i := range r.ch {
-		r.ch[i].advance(now)
+		// A channel at rest stays where it is until headFor moves it on,
+		// which advances it first.
+		if ch := &r.ch[i]; ch.moving || ch.pending {
+			ch.advance(now)
+		}
 		v[i] = float32(r.ch[i].value)
+	}
+	// Draggable moves it along with its pose.
+	d := e.st.dragRec
+	if d.current(rt) {
+		moving := d.moving()
+		d.advance(now)
+		if moving && !d.moving() {
+			// It came to rest in a frame that only paints: the view
+			// builds again, to see it there (Transitioning).
+			rt.animating = true
+		}
+		p := d.shown()
+		v[0] += p.X
+		v[1] += p.Y
 	}
 	e.poseM = scene.Affine{}
 	if v[0] != 0 || v[1] != 0 || v[2] != 1 || v[3] != 0 {
 		e.poseM = scene.Translation(v[0], v[1]).Mul(scene.Rotation(v[3])).Mul(scene.Scaling(v[2], v[2]))
 	}
 	e.poseFade = max(0, min(v[4], 1))
-	if r.moving() {
+	if r.moving() || d.current(rt) && d.moving() {
 		rt.repainting = true
 	}
 }
 
 // repose moves the posed elements of the last frame built on to the time
-// of a frame that only paints, with what is inside them.
+// of a frame that only paints, with what is inside them. It moves every
+// pose first, and then sets the transforms to the window again from the
+// outermost elements that moved, once for what is inside them: poses
+// nested in moving poses would otherwise set those inside again and again.
 func (rt *engine) repose() {
 	for _, e := range rt.posed {
-		if r := e.st.pose; r != nil && r.moving() {
+		e.reposed = false
+		d := e.st.dragRec
+		if r := e.st.pose; r != nil && (r.moving() || d.current(rt) && d.moving()) {
 			rt.showPose(e, r)
+			e.reposed = true
+		}
+	}
+	for _, e := range rt.posed {
+		if e.reposed && !e.insideReposed() {
 			e.updateWorld()
 		}
 	}
+}
+
+// insideReposed reports whether an element around e moved its pose in
+// this frame.
+func (e *node) insideReposed() bool {
+	for p := e.parent; p != nil; p = p.parent {
+		if p.reposed {
+			return true
+		}
+		if p == e.c.overlay {
+			// The overlay's place does not follow those around it.
+			return false
+		}
+	}
+	return false
 }
 
 // updateWorld sets the transform from e to the window again, and those of

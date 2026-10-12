@@ -101,10 +101,12 @@ framework safely. Read it before changing anything under `internal/`.
 ├── ui/                 native UI: views, layout, widgets, text editing, Tester;
 │                       ui/chart: charts without a look, on ui's public API
 ├── transfer/           immutable data items, representations, lazy providers and drag effects
+├── audio/              sound: players, the mixer, the output of each platform, WAV;
+│                       audio/vorbis and audio/mp3 decode Ogg Vorbis and MP3
 ├── cmd/mygo/           the CLI: init, generate, dev, build, doctor
 ├── examples/           hello, todo, frameless, native; counter-native, vibrancy,
-│                       effort-slider, flyout, menubar-flyout and gallery
-│                       (native UI); webview (web views in native UI)
+│                       effort-slider, flyout, menubar-flyout, piano and
+│                       gallery (native UI); webview (web views in native UI)
 ├── docs/               the user guides, the official plugins' pages
 │                       (plugins/), and this architecture guide
 └── website/            the website, with these docs: TanStack Start, prerendered
@@ -386,8 +388,13 @@ purego gives three primitives, used everywhere:
   runtime in the registry (`EdgeUpdate\ClientState\<channel>\EBWebView`)
   and calls `CreateWebViewEnvironmentWithOptionsInternal` of its
   `EmbeddedBrowserWebView.dll`, as `WebView2Loader.dll` does; a loader next to
-  the executable wins. The first window that shows a web page starts the
-  environment (`startEnvironment`), and fails without a runtime: windows
+  the executable wins. `internal/webview2` finds the runtime, for the backend
+  and for `mygo doctor`: a directory holding that library for this
+  architecture and the browser process `msedgewebview2.exe` at its root (the
+  library alone is the Edge browser's, whose environments fail with
+  `ERROR_NOT_SUPPORTED`), and EdgeUpdate's record of a runtime outlives its
+  files. The first window that shows a web page starts
+  the environment (`startEnvironment`), and fails without a runtime: windows
   that show native UI need none, so an app whose windows all do runs
   without WebView2. The environment and each controller are created
   asynchronously: window methods that need the webview wait in `pending`.
@@ -1098,11 +1105,14 @@ as in Tauri:
   restarts), so progress and a hidden button set before showing stick.
 - `WindowOptions.StateKey` (`window_state.go`) remembers a window's normal
   bounds and maximized/full screen state in `window-state.json` in
-  `PathUserData`, like Tauri's window-state plugin. The state is captured
+  `PathUserData`, like Tauri's window-state plugin, or in the app's
+  `WindowStateStore` (`App.SetWindowStateStore`), which loads all the
+  states once and saves them all, on the main thread. The state is captured
   300 ms after the last move/resize/state event (transitions resize the
   window on the way, and the normal bounds only change in the normal
-  state) and when the window closes; it is written when a window closes
-  and when the app quits. A saved window that would not show on any
+  state) and when the window closes; it is saved when a window closes
+  and when the app quits, if it changed, and kept for the next save when
+  saving fails. A saved window that would not show on any
   display keeps its size and is centered. `WindowOptions.Maximized` starts
   a window maximized: `zoom:` on macOS, `gtk_window_maximize` before
   mapping on Linux, `SW_SHOWMAXIMIZED` on the first show on Windows, where
@@ -1307,6 +1317,45 @@ object or user data. Native reads copy bytes so application data outlives
 native handles. See [Clipboard and drag data](data-transfer.md) for API and
 format mappings.
 
+## Audio (`audio`)
+
+Package `audio` is independent of windows and the main thread: it neither
+goes through `internal/platform` nor needs the app running. Players are
+voices (`audio/mixer.go`) under one mutex. Each reads frames from a source,
+an in-memory sound or a stream that a goroutine of its own decodes about a
+second ahead into a ring (`audio/source.go`); the mixer never waits on a
+stream, playing silence for one that is late. Voices resample to 48 kHz
+stereo with a Catmull-Rom spline at their rate times their speed, and ramp
+their gains (a 2×2 matrix of volume and pan) over 5 ms on every change,
+pause and resume. Looping happens in the source, so a loop has no gap; the
+voice counts frames past it modulo the length for `Position`.
+
+The output (`audio/output.go`) is a goroutine locked to one thread that
+opens the device when a voice starts, mixes 10 to 21 ms at a time and
+writes it with a call that blocks while the device holds enough, and
+closes the device after five idle seconds. Each platform gives one
+`openDevice`:
+
+- macOS: an Audio Queue of four buffers of 512 frames, started once all
+  hold audio; its callback, created once, hands buffers back over a channel.
+- Linux: `pa_simple_write` of PulseAudio's simple API (`libpulse-simple`,
+  which PipeWire serves too) with a 40 ms target, else ALSA's
+  `snd_pcm_writei` on `default`, both through purego.
+- Windows: WASAPI in shared mode, event driven, with a 40 ms buffer,
+  `AUTOCONVERTPCM` and the default-quality resampler; it compares the
+  default endpoint's ID every 500 ms and fails the write when it changed,
+  which reopens the device.
+- Browsers: an AudioWorklet from a Blob URL that queues three chunks and
+  posts a request whenever it used one; the output waits for a request
+  before mixing the next. One AudioContext serves the page; closing
+  suspends it, and the first pointer or key input resumes it.
+
+Where `openDevice` fails, a null device takes the frames on the wall
+clock and fails after two seconds, so the output tries the device again;
+`audio.Err` reports the failure. Formats register a magic prefix and a
+constructor as `image` does: WAV is built in, `audio/vorbis` and
+`audio/mp3` wrap pure Go decoders.
+
 ## Native UI (`ui`)
 
 The public API keeps one stable `*Context` per window. Child builders share
@@ -1362,7 +1411,9 @@ either.
   showing it (`RefreshRate`: the screen's `maximumFramesPerSecond`, GDK's
   `gdk_monitor_get_refresh_rate`, the display mode's frequency from
   `EnumDisplaySettingsW`); asks for a frame (`RequestFrame`: a
-  paused `CADisplayLink`, before macOS 14 an `NSTimer` at the display's
+  paused `CADisplayLink`, whose ticks draw frames that follow each other
+  themselves while a frame after a pause, or after a resize, draws when
+  AppKit displays the view, before macOS 14 an `NSTimer` at the display's
   rate, `gtk_widget_queue_draw` or a tick callback of GTK's frame clock,
   `InvalidateRect`); presents
   pixels drawn on the CPU (`PresentPixels`: a CGImage as the layer's
@@ -1523,6 +1574,14 @@ either.
   `SurfaceShown`, sent as some of the window shows again
   (`windowDidChangeOcclusionState:`), has a held animation go on from
   where the time puts it.
+  The window gaining or losing the keyboard focus draws a frame only when
+  the last frame read it (`windowFocus`, as a focus ring, a caret, a
+  selection's color or a focused text input's IME state do): a window
+  hiding or showing again draws nothing it would draw the same. Each
+  frame matters on macOS, where the Metal driver takes 30 to 45 MB of the
+  process's footprint ("owned unmapped (graphics)") for the first command
+  buffer encoding anything after a pause, and gives them back a second or
+  two after the last, as a bare Metal app does.
   A frame allocates next to nothing once the view builds what it built
   before: elements come from the context's arena, the default theme is
   copied for each pass, the states that pruning frees go to new elements
@@ -1570,15 +1629,24 @@ either.
   of animation, so position and velocity survive interruptions (a curve's
   velocity is its easing's slope). A delayed target waits in the channel
   while the old path goes on. `Jump` sets values and derives a velocity
-  from successive ones; presses keep their last moves (`dragTrack`) for
-  `DragVelocity` and `DragEnded`. Keyframe sequences keep one sequence per
+  from successive ones; presses keep their last moves (`dragTrack`), in
+  the element's axes and the window's, for `DragVelocity` and
+  `DragEnded`. Keyframe sequences keep one sequence per
   key with an explicit replay token. All ask for frames only while moving,
   and end at their targets under reduced motion. Poses (`ui/pose.go`,
   `AnimatePose`) are channels sampled as frames commit, into a transform
   after the element's own (`poseM`) and a fade; frames that only paint
   (`repaintFrame`) move the posed elements of the last frame built on
   (`repose`) and set their subtrees' transforms again (`updateWorld`), so
-  they move without the view running. Content transitions (`ui/content.go`)
+  they move without the view running. `Draggable` (`ui/draggable.go`)
+  keeps two channels of an offset (`dragRec`) that `showPose` adds to the
+  pose's translation: as the pointer drags the element, they hold where
+  the press's move in the window (`dragTrack`), mapped into the parent's
+  axes through the inverse of its last world transform, takes the offset
+  from where the press caught it, so they are the same in every build
+  pass of a frame; once let go, a spring starts at the release's velocity
+  for where `Snap` chooses from the projected throw, and goes on in frames
+  that only paint, the view building once more when it comes to rest. Content transitions (`ui/content.go`)
   keep what an element showed, and fade or roll it into what it shows as
   it paints, counting paintings (`engine.paints`) rather than frames
   built, so frames that only paint move them on too.
@@ -2344,16 +2412,25 @@ either.
     source until it has cached it; a library older than `shader.metal`
     falls back to that, and its test fails. It draws into a CAMetalLayer
     it adds to the surface view's layer. The command queue, shaders,
-    sampler and placeholder texture are made on demand. Its frames
-    present with the Core Animation transaction (`presentsWithTransaction`), so a live resize
-    shows no stretched frames, and each frame waits for the GPU to finish
-    the last before it updates the textures and the instance buffer the
-    last read. The layer allows three drawables so a frame can acquire a
-    spare while Core Animation holds the presented frames, reducing
-    main-thread waits at high refresh rates. This retains one more frame
-    of memory while animating than a two-drawable pool. Two seconds after
-    the last frame, as the driver frees its own memory of frames, a timer
-    shrinks the drawables,
+    sampler and placeholder texture are made on demand. A frame that
+    changes the layer (its size, scale or pixel format), or shows web
+    views, which move in the window's transaction, presents with the Core
+    Animation transaction (`presentsWithTransaction`), so a live resize
+    shows no stretched frames; the others present as soon as the GPU has
+    them (`presentDrawable:`), sparing a pass of AppKit's display cycle
+    and a commit of the transaction each: an animation at 120 Hz takes
+    about half the main thread's time it would. A frame presented so
+    that waited for its drawable, as the display held the available drawables until its next
+    refresh, has the next skip a refresh (`Behind`, at most once a
+    second), or the frames after would wait as long, most of each
+    refresh, blocking the main thread. Each frame waits for the GPU to
+    finish the last before it updates the textures and the instance
+    buffer the last read. The layer allows three drawables so a frame can
+    acquire a spare while Core Animation holds the presented frames,
+    reducing main-thread waits at high refresh rates. This retains one
+    more frame of memory while animating than a two-drawable pool. Two
+    seconds after the last frame, as the driver frees its own memory of
+    frames, a timer shrinks the drawables,
     which frees all but the one shown, until the next frame makes them
     again, and releases GPU instance buffers, atlas/image textures and
     backdrop textures: an idle window keeps one frame of memory. Its
@@ -2615,7 +2692,9 @@ renderer's (`gputest.Compare`).
   to the main package, with `//go:embed all:mygo_frontend` and a call to
   `SetFrontend`, and maps every `frontendDist` file into that virtual
   directory, so the frontend may live anywhere. macOS targets become `.app`
-  bundles (Info.plist, `.icns` rendered in pure Go), signed with
+  bundles (Info.plist, `.icns` rendered in pure Go, and with `macos.icon`
+  an `Assets.car`, as it is or compiled from an Icon Composer `.icon` by
+  `xcrun actool`), signed with
   `macos.signingIdentity` (hardened runtime and timestamp for real
   identities, ad hoc by default); `darwin/universal` combines both
   architectures with a pure-Go fat-binary writer. Linux gets a `.desktop`
@@ -2641,7 +2720,7 @@ renderer's (`gputest.Compare`).
   links inside them are copied as links, permissions are kept. Installed
   paths must be unique ignoring case (listed resources never merge), and
   top-level names must not replace the packaging's own files
-  (`AppIcon.icns`, the executable, the `.desktop` entry). Code
+  (`AppIcon.icns`, `Assets.car`, the executable, the `.desktop` entry). Code
   among them is signed before the app (`signNestedCode`), since
   `codesign --deep` only covers code directories and notarization rejects
   unsigned code: Mach-O files, then the bundles holding them, deepest
@@ -2985,5 +3064,6 @@ which npm allows only for packages that exist: the first release uses an
 | native UI surface | layer-backed NSView, frames from `CADisplayLink` (a timer at the display's rate before macOS 14), input methods through NSTextInputClient | GtkGLArea (GtkDrawingArea without a GPU), GtkIMMulticontext | `MyGoSurface` child window, IMM32 |
 | native UI data drags | NSDraggingSession, NSPasteboardItemDataProvider, NSDraggingDestination | GTK drag contexts, MIME selections, text/uri-list | OLE IDataObject, IDropSource, IDropTarget, Shell drag images |
 | native UI accessibility | `NSAccessibilityElement` subclasses | ATK objects (GObject types registered through purego), bridged to AT-SPI by GTK | UI Automation fragments (COM objects; assembly thunks for the methods taking doubles) |
-| native UI rendering | Metal, into a CAMetalLayer presenting with the Core Animation transaction | OpenGL 3.3 or ES 3.0 in the GtkGLArea's render signal; on the CPU, painted with cairo, where OpenGL runs on the CPU | Direct3D 11 (WARP without a GPU), flip-model swap chain |
+| native UI rendering | Metal, into a CAMetalLayer presenting as soon as drawn, or with the Core Animation transaction for frames that resize it or show web views | OpenGL 3.3 or ES 3.0 in the GtkGLArea's render signal; on the CPU, painted with cairo, where OpenGL runs on the CPU | Direct3D 11 (WARP without a GPU), flip-model swap chain |
 | web views in native UI | WKWebView in a clip view under the surface; `hitTest:` lets the pointer through | WebKitWebView in a `GtkLayout` under the area in a `GtkOverlay`; an input shape lets the pointer through | WebView2 composition controller in a DirectComposition target under the frames'; the surface sends it the mouse |
+| audio output | Audio Queue on the default output | PulseAudio simple API (PipeWire too), else ALSA `default` | WASAPI shared mode, reopened when the default output changes |
