@@ -338,8 +338,42 @@ func TestCullDrawsTheSamePixels(t *testing.T) {
 	r.b.NoCull = false
 }
 
+// TestRingSplitDrawsTheSamePixels draws border-only fills around the core
+// inside their border and whole, in BGRA8 and float16 targets, and requires
+// the same bytes, and the CPU renderer's pixels.
+func TestRingSplitDrawsTheSamePixels(t *testing.T) {
+	r, err := newRenderer()
+	if err != nil {
+		unavailable(t, err)
+	}
+	defer r.Release()
+	for _, wide := range []bool{false, true} {
+		if wide && !r.SetWide(true) {
+			t.Log("no wide target:", r.wideErr)
+			continue
+		}
+		for _, c := range gputest.RingCases() {
+			r.b.NoRingSplit = false
+			split := renderRaw(t, r, c.Scene, wide)
+			instances := len(r.b.Instances)
+			r.b.NoRingSplit = true
+			whole := renderRaw(t, r, c.Scene, wide)
+			if c.Split && instances <= len(r.b.Instances) {
+				t.Errorf("%s wide=%v: the split drew %d instances, whole %d", c.Name, wide, instances, len(r.b.Instances))
+			}
+			if d := differing(split, whole); d != 0 {
+				t.Errorf("%s wide=%v: %d bytes differ between split and whole", c.Name, wide, d)
+			}
+			if !wide {
+				gputest.Compare(t, "metal-ring-"+c.Name, split, c.Scene.Width*4, c.Scene)
+			}
+		}
+	}
+	r.b.NoRingSplit = false
+}
+
 // identityCases are the scenes of the identity tests of changes to how
-// scenes are drawn: the cases of the cull and shadow tests, the
+// scenes are drawn: the cases of the cull, ring and shadow tests, the
 // scenes of fills and opaque fills at window sizes, the reference scene and
 // the scenes of transformed content.
 func identityCases() []gputest.CullCase {
@@ -347,6 +381,9 @@ func identityCases() []gputest.CullCase {
 		{Name: "perspective scene", Scene: gputest.PerspectiveScene()}, {Name: "axis clip scene", Scene: gputest.AxisClipScene()},
 		{Name: "continuous scene", Scene: gputest.ContinuousScene()}}
 	cases = append(cases, gputest.CullCases()...)
+	for _, c := range gputest.RingCases() {
+		cases = append(cases, gputest.CullCase{Name: "ring " + c.Name, Scene: c.Scene})
+	}
 	for i, c := range gputest.ShadowCases() {
 		cases = append(cases, gputest.CullCase{Name: fmt.Sprint("shadow case ", i), Scene: gputest.ShadowPanelScene(c)})
 	}
@@ -364,7 +401,7 @@ func identityCases() []gputest.CullCase {
 }
 
 // TestSplitsDrawTheSamePixels draws every identity case with the shadow and
-// splits and without them, in BGRA8 and float16, and requires the same
+// ring splits and without them, in BGRA8 and float16, and requires the same
 // bytes. The cases include rounded, continuous and rotated clips with masks,
 // where the pieces must not change the clip's mask area.
 func TestSplitsDrawTheSamePixels(t *testing.T) {
@@ -380,10 +417,10 @@ func TestSplitsDrawTheSamePixels(t *testing.T) {
 			continue
 		}
 		for _, c := range identityCases() {
-			r.b.NoShadowSplit = false
+			r.b.NoRingSplit, r.b.NoShadowSplit = false, false
 			split := renderRaw(t, r, c.Scene, wide)
 			n := len(r.b.Instances)
-			r.b.NoShadowSplit = true
+			r.b.NoRingSplit, r.b.NoShadowSplit = true, true
 			whole := renderRaw(t, r, c.Scene, wide)
 			pieces += n - len(r.b.Instances)
 			if d := differing(split, whole); d != 0 {
@@ -394,7 +431,7 @@ func TestSplitsDrawTheSamePixels(t *testing.T) {
 	if pieces == 0 {
 		t.Error("nothing was split")
 	}
-	r.b.NoShadowSplit = false
+	r.b.NoRingSplit, r.b.NoShadowSplit = false, false
 }
 
 // TestCullTransformedShadows draws a shadow under a transform, scaled, rotated,

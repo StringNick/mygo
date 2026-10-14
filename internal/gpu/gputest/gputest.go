@@ -385,6 +385,109 @@ func ShadowCases() []ShadowCase {
 	}
 }
 
+// RingCase is a scene of border-only fills (a transparent solid color and a
+// border), over content that shows when one of them wrongly changes a pixel.
+type RingCase struct {
+	Name  string
+	Scene *scene.Scene
+	// Split is whether the builder draws the first ring around its core.
+	Split bool
+}
+
+// RingCases are border-only fills at the size of panels (the shaders shade
+// their cores for nothing unless the builder draws around them): square,
+// round and continuous corners, uneven widths and radii, a dashed border,
+// fractional places, borders under clips, translucent and opaque border
+// colors, at half opacity, one with a border wider than half the panel,
+// and fills that are not split: a gradient, a translucent color, a
+// transformed fill, a small one and a thin one.
+func RingCases() []RingCase {
+	blue := scene.Color{R: 37, G: 99, B: 235, A: 255}
+	red := scene.Color{R: 220, G: 40, B: 40, A: 255}
+	paper := scene.Color{R: 246, G: 247, B: 249, A: 255}
+	r4 := func(r float32) [4]float32 { return [4]float32{r, r, r, r} }
+	// content returns a 480×360 scene of fills, a shadow and a glyph run,
+	// which the ring is drawn over, and the clip to push, if any.
+	content := func() *scene.Scene {
+		s := &scene.Scene{Width: 480, Height: 360, Clear: scene.Color{R: 30, G: 34, B: 40, A: 255},
+			Text: scene.TextParams{GammaRatios: scene.GammaRatios(1.8), Contrast: 1, SubpixelContrast: 0.5}}
+		s.MaskAtlas, s.Text, s.Glyphs = glyphContent()
+		s.Ops = append(s.Ops,
+			scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 10, Y: 10, W: 460, H: 340}, Radii: r4(20), Color: paper},
+			scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 100, Y: 80, W: 200, H: 120}, Color: blue, Color2: red, Paint: scene.PaintLinear, Gradient: [4]float32{100, 0, 300, 0}},
+			scene.Op{Kind: scene.OpShadow, Rect: scene.Rect{X: 160, Y: 160, W: 160, H: 100}, Radii: r4(12), Color: scene.Color{A: 120}, Blur: 24})
+		s.Ops = append(s.Ops, scene.Op{Kind: scene.OpGlyphs, Start: 0, End: int32(len(s.Glyphs))})
+		return s
+	}
+	var out []RingCase
+	add := func(name string, split bool, clip *scene.Op, ops ...scene.Op) {
+		s := content()
+		if clip != nil {
+			s.Ops = append(s.Ops, *clip)
+		}
+		s.Ops = append(s.Ops, ops...)
+		if clip != nil {
+			s.Ops = append(s.Ops, scene.Op{Kind: scene.OpPopClip})
+		}
+		out = append(out, RingCase{name, s, split})
+	}
+	ring := func(r scene.Rect, radii [4]float32, w [4]float32, c scene.Color) scene.Op {
+		return scene.Op{Kind: scene.OpFill, Rect: r, Radii: radii, Border: w, BorderColor: c}
+	}
+	panel := scene.Rect{X: 20, Y: 20, W: 440, H: 320}
+	half := scene.Color{R: 255, G: 255, B: 255, A: 90}
+	add("square 1px", true, nil, ring(panel, [4]float32{}, scene.Uniform(1), half))
+	add("square 2px opaque", true, nil, ring(panel, [4]float32{}, scene.Uniform(2), red))
+	add("rounded", true, nil, ring(panel, r4(16), scene.Uniform(2), half))
+	add("continuous", true, nil, func() scene.Op {
+		op := ring(panel, r4(24), scene.Uniform(2), half)
+		op.Continuous = true
+		return op
+	}())
+	add("uneven widths and radii", true, nil, ring(panel, [4]float32{30, 0, 8, 20}, [4]float32{1, 3, 2, 5}, half))
+	add("uneven continuous", true, nil, func() scene.Op {
+		op := ring(panel, [4]float32{30, 6, 8, 20}, [4]float32{3, 1, 4, 2}, half)
+		op.Continuous = true
+		return op
+	}())
+	add("fractional place", true, nil, ring(scene.Rect{X: 20.5, Y: 20.25, W: 439.3, H: 320.6}, r4(12), scene.Uniform(1.5), half))
+	add("dashed", true, nil, func() scene.Op {
+		op := ring(panel, r4(10), scene.Uniform(2), blue)
+		op.Dashed = true
+		return op
+	}())
+	add("half opacity", true, nil, func() scene.Op {
+		op := ring(panel, r4(10), scene.Uniform(3), blue)
+		op.Opacity = 0.5
+		return op
+	}())
+	add("wide border", true, nil, ring(panel, r4(40), scene.Uniform(60), half))
+	add("clipped", true, &scene.Op{Kind: scene.OpPushClip, Rect: scene.Rect{X: 30, Y: 30, W: 300, H: 280}}, ring(panel, r4(16), scene.Uniform(2), half))
+	add("fractional clip", true, &scene.Op{Kind: scene.OpPushClip, Rect: scene.Rect{X: 30.5, Y: 30.25, W: 300.4, H: 280.7}}, ring(panel, r4(16), scene.Uniform(2), half))
+	add("rounded clip", true, &scene.Op{Kind: scene.OpPushClip, Rect: scene.Rect{X: 30, Y: 30, W: 300, H: 280}, Radii: r4(30)}, ring(panel, r4(16), scene.Uniform(2), half))
+	add("frame edges", true, nil, ring(scene.Rect{X: -10, Y: -10, W: 500, H: 380}, r4(12), scene.Uniform(2), half))
+	add("two rings", true, nil, ring(panel, r4(16), scene.Uniform(2), half), ring(scene.Rect{X: 30, Y: 30, W: 420, H: 300}, r4(8), scene.Uniform(1), red))
+	add("a fill with a border", false, nil, func() scene.Op {
+		op := ring(panel, r4(16), scene.Uniform(2), half)
+		op.Color = scene.Color{R: 255, G: 255, B: 255, A: 1}
+		return op
+	}())
+	add("gradient", false, nil, func() scene.Op {
+		op := ring(panel, r4(16), scene.Uniform(2), half)
+		op.Paint, op.Color, op.Color2, op.Gradient = scene.PaintLinear, scene.Color{A: 0}, scene.Color{R: 255, A: 200}, [4]float32{20, 0, 460, 0}
+		return op
+	}())
+	add("transformed", false, nil, func() scene.Op {
+		op := ring(panel, r4(16), scene.Uniform(2), half)
+		op.Transform = scene.Scaling(0.98, 0.98)
+		return op
+	}())
+	add("small", false, nil, ring(scene.Rect{X: 100, Y: 100, W: 40, H: 30}, r4(6), scene.Uniform(1), half))
+	add("thin", false, nil, ring(scene.Rect{X: 20, Y: 20, W: 440, H: 6}, r4(2), scene.Uniform(1), half))
+	add("border fills the panel", false, nil, ring(scene.Rect{X: 20, Y: 20, W: 100, H: 100}, [4]float32{}, scene.Uniform(60), half))
+	return out
+}
+
 // CullCase is a scene of ops, some of them under later opaque fills, and how
 // many of them a renderer may leave out, which must change no pixel. The
 // identity tests use it as a named scene.

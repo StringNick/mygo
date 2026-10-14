@@ -134,7 +134,11 @@ type Builder struct {
 	Wide bool
 	// NoShadowSplit draws every shadow as one instance, for comparison tests.
 	NoShadowSplit bool
-	// NoCull draws covered ops too, for comparison tests.
+	// NoRingSplit draws every border-only fill as one instance (see
+	// addFill), for tests that compare the two.
+	NoRingSplit bool
+	// NoCull draws every op, even those that later opaque fills cover whole
+	// (see planCull), for tests that compare the two.
 	NoCull bool
 	// Culled is how many ops the last Build left out as covered.
 	Culled       int
@@ -282,12 +286,12 @@ func (b *Builder) Build(s *scene.Scene, image func(*scene.Image) uintptr) *scene
 				dashed = 1
 			}
 			w := b.wideOf(s, op.Wide)
-			b.add(Instance{
+			b.addFill(Instance{
 				Rect: rect(op.Rect), Radii: radii, Inner: inner,
 				Color: wideColor(w, scene.WideColor, op.Color), Color2: wideColor(w, scene.WideColor2, op.Color2), Border: wideColor(w, scene.WideBorder, op.BorderColor), Grad: op.Gradient,
 				UV:     bw,
 				Params: [4]float32{0, dashed, float32(op.Paint), opacity(op.Opacity)},
-			}, 0, op.Transform)
+			}, op)
 		case scene.OpShadow:
 			if op.Inset {
 				// The box in Rect, the hole in UV and Inner, which an
@@ -572,6 +576,48 @@ func worthSplitting(core, quad Scissor) bool {
 	hole := core.intersect(quad)
 	a := hole.area()
 	return a >= shadowSplitMin && 4*a >= quad.area()
+}
+
+// ringCore returns the pixels that a fill of the rectangle r with corner
+// radii (negative when continuous, as in Instance) and border widths bw
+// (top, right, bottom, left) certainly covers whole, and whose inner edge
+// does too: the outer shape's coverage and the inner one's are both 1, so
+// the border's coverage, their difference, is 0 there.
+func ringCore(r scene.Rect, radii, bw [4]float32, continuous bool) Scissor {
+	inner, innerRadii := scene.InnerRadii(r, radii, bw)
+	if inner.W <= 0 || inner.H <= 0 {
+		return Scissor{}
+	}
+	return shadowCore(r, radii, continuous).intersect(shadowCore(inner, innerRadii, continuous))
+}
+
+// addFill appends the instance of a fill. A fill that draws only its border
+// (a transparent solid color, a border of some width: focus rings, outlines
+// and card borders around window-sized panels) is drawn as up to four
+// instances around the core inside its border, as addShadow does, so that
+// the renderers shade no fragment where the shader writes exactly nothing: the
+// outer and inner coverages are both 1 there, the border's is their
+// difference, and the color is transparent. Without it a 2 pixel ring around
+// a 5 Mpx panel shaded the whole panel, twice over, through the general
+// path. The pixels are identical.
+func (b *Builder) addFill(in Instance, op *scene.Op) {
+	cur := &b.stack[len(b.stack)-1]
+	if b.NoRingSplit || op.Transform.Set || op.Paint != scene.PaintSolid || in.Color[3] != 0 || !scene.HasBorder(in.UV) ||
+		op.Rect.Empty() || cur.scissor.Empty() {
+		b.add(in, 0, op.Transform)
+		return
+	}
+	// A fill's quad reaches a pixel out of its rectangle (see the vertex shader).
+	quad := Scissor{
+		Left: int32(math.Floor(float64(op.Rect.X - 1))), Top: int32(math.Floor(float64(op.Rect.Y - 1))),
+		Right: int32(math.Ceil(float64(op.Rect.X + op.Rect.W + 1))), Bottom: int32(math.Ceil(float64(op.Rect.Y + op.Rect.H + 1))),
+	}.intersect(cur.scissor)
+	core := ringCore(op.Rect, in.Radii, in.UV, op.Continuous)
+	if !worthSplitting(core, quad) {
+		b.add(in, 0, op.Transform)
+		return
+	}
+	b.addAround(in, op.Transform, core)
 }
 
 // addEffect appends the instance of an effect within the current clip, in

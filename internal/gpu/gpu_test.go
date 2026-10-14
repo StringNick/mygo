@@ -290,6 +290,65 @@ func TestCullPlanIsBounded(t *testing.T) {
 	}
 }
 
+// ringFragments returns the area of the scissor rectangles of the
+// border-only fills with a solid color that b built, and how many there are.
+func ringFragments(b *Builder) (area int64, n int) {
+	for _, bt := range b.Batches {
+		for _, in := range b.Instances[bt.Start : bt.Start+bt.Count] {
+			if in.Params[0] == 0 && in.Params[2] == 0 && in.Color[3] == 0 && scene.HasBorder(in.UV) {
+				area += bt.Scissor.area()
+				n++
+			}
+		}
+	}
+	return area, n
+}
+
+// TestRingSplitShrinksTheShaded checks that a border-only fill the size of a
+// panel is drawn around the core inside its border, in pieces that tile the
+// frame less that core, and that other fills are not split.
+func TestRingSplitShrinksTheShaded(t *testing.T) {
+	for _, c := range gputest.RingCases() {
+		var split, whole Builder
+		whole.NoRingSplit = true
+		split.NoCull, whole.NoCull = true, true
+		tex := func(*scene.Image) uintptr { return 1 }
+		split.Build(c.Scene, tex)
+		whole.Build(c.Scene, tex)
+		sa, sn := ringFragments(&split)
+		wa, wn := ringFragments(&whole)
+		if !c.Split {
+			if len(split.Instances) != len(whole.Instances) {
+				t.Errorf("%s: %d instances, want %d (not split)", c.Name, len(split.Instances), len(whole.Instances))
+			}
+			continue
+		}
+		if wn == 0 || sn <= wn || sa >= wa {
+			t.Errorf("%s: split shades %d px in %d instances, whole %d px in %d", c.Name, sa, sn, wa, wn)
+		}
+	}
+	// The pieces of the first ring of a plain case lie outside its core,
+	// and with the clip's scissor rectangle tile what is left.
+	c := gputest.RingCases()[2] // rounded
+	var b Builder
+	b.Build(c.Scene, nil)
+	core := ringCore(scene.Rect{X: 20, Y: 20, W: 440, H: 320}, [4]float32{16, 16, 16, 16}, scene.Uniform(2), false)
+	var covered int64
+	for _, bt := range b.Batches {
+		for _, in := range b.Instances[bt.Start : bt.Start+bt.Count] {
+			if in.Params[0] == 0 && in.Color[3] == 0 && scene.HasBorder(in.UV) {
+				if bt.Scissor.intersect(core).area() != 0 {
+					t.Errorf("piece %v reaches the core %v", bt.Scissor, core)
+				}
+				covered += bt.Scissor.area()
+			}
+		}
+	}
+	if want := int64(c.Scene.Width*c.Scene.Height) - core.area(); covered != want {
+		t.Errorf("pieces cover %d px, want %d", covered, want)
+	}
+}
+
 // TestCullKeepsTransformedShadows checks that the planner does not leave out a
 // shadow under a transform whose blur reaches out of the cover over it: the blur
 // grows with the scale, so a shadow of blur 20 at scale 4 reaches about 120
