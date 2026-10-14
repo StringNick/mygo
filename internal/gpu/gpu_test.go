@@ -396,6 +396,50 @@ func TestOpaqueCores(t *testing.T) {
 	}
 }
 
+// TestBatchClasses checks the class of each batch: plain fills (with and
+// without continuous corners, in one batch), other fills, shadows, glyphs and
+// images, and that transformed instances take the general shader.
+func TestBatchClasses(t *testing.T) {
+	red := scene.Color{R: 255, A: 255}
+	atlas := scene.NewAtlas(1, 64, 32)
+	img := scene.NewImageRGBA(2, 2, make([]byte, 16))
+	s := &scene.Scene{Width: 200, Height: 100, MaskAtlas: atlas}
+	s.Glyphs = []scene.Glyph{{X: 10, Y: 20, W: 8, H: 9, U: 16, V: 8, UW: 8, VH: 9, Color: red}}
+	r := func(x float32) scene.Rect { return scene.Rect{X: x, Y: 10, W: 20, H: 20} }
+	s.Ops = []scene.Op{
+		{Kind: scene.OpFill, Rect: r(0), Color: red},
+		{Kind: scene.OpFill, Rect: r(30), Radii: [4]float32{4, 4, 4, 4}, Continuous: true, Color: red},
+		{Kind: scene.OpFill, Rect: r(60), Radii: [4]float32{4, 4, 4, 4}, Color: red},
+		{Kind: scene.OpFill, Rect: r(90), Color: red, Border: scene.Uniform(1), BorderColor: red},
+		{Kind: scene.OpShadow, Rect: r(0), Color: red, Blur: 8},
+		{Kind: scene.OpGlyphs, Start: 0, End: 1},
+		{Kind: scene.OpImage, Rect: r(0), Image: img, Src: scene.Rect{W: 2, H: 2}},
+		{Kind: scene.OpFill, Rect: r(120), Color: red, Transform: scene.Translation(1, 1)},
+	}
+	var b Builder
+	b.Classes = true
+	b.Build(s, func(*scene.Image) uintptr { return 1 })
+	want := []Class{ClassPlain, ClassFill, ClassShadow, ClassGlyph, ClassImage, ClassGeneral}
+	if len(b.Batches) != len(want) {
+		t.Fatalf("%d batches: %+v", len(b.Batches), b.Batches)
+	}
+	for i, c := range want {
+		if b.Batches[i].Class != c {
+			t.Errorf("batch %d: class %d, want %d", i, b.Batches[i].Class, c)
+		}
+	}
+	if b.Batches[0].Count != 3 {
+		t.Errorf("the plain fills share a batch of %d", b.Batches[0].Count)
+	}
+	b.NoClasses = true
+	b.Build(s, func(*scene.Image) uintptr { return 1 })
+	for i, bt := range b.Batches {
+		if bt.Class != ClassGeneral {
+			t.Errorf("NoClasses: batch %d has class %d", i, bt.Class)
+		}
+	}
+}
+
 // TestCullKeepsTransformedShadows checks that the planner does not leave out a
 // shadow under a transform whose blur reaches out of the cover over it: the blur
 // grows with the scale, so a shadow of blur 20 at scale 4 reaches about 120
@@ -460,6 +504,24 @@ func TestFillsInsideTheirClipSkipItsCoverage(t *testing.T) {
 	for k, in := range b.Instances {
 		if in.Transform1[3] == 3 {
 			t.Errorf("instance %d skips the clip with NoClipSkip", k)
+		}
+	}
+}
+
+// Renderers that have not opted in retain the general shader contract.
+func TestShaderCapabilitiesAreOptIn(t *testing.T) {
+	s := &scene.Scene{Width: 100, Height: 100, Ops: []scene.Op{
+		{Kind: scene.OpFill, Rect: scene.Rect{X: 10, Y: 10, W: 20, H: 20}, Color: scene.Color{A: 255}},
+		{Kind: scene.OpShadow, Rect: scene.Rect{X: 50, Y: 50, W: 20, H: 20}, Color: scene.Color{A: 128}, Blur: 4},
+	}}
+	var b Builder
+	b.Build(s, nil)
+	if len(b.Batches) != 1 || b.Batches[0].Class != ClassGeneral {
+		t.Fatalf("default builder split shader classes: %+v", b.Batches)
+	}
+	for _, in := range b.Instances {
+		if in.Transform1[3] == 3 {
+			t.Fatal("default builder emitted a Metal-only clip flag")
 		}
 	}
 }

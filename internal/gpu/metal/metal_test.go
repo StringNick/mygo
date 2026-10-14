@@ -4,11 +4,13 @@ package metal
 
 import (
 	"bytes"
+	_ "embed"
 	"errors"
 	"fmt"
 	"math"
 	"os"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/egoist/mygo/internal/gpu"
@@ -26,6 +28,13 @@ func unavailable(t testing.TB, err error) {
 		t.Fatal("no Metal (MYGO_GPU_REQUIRED is set):", err)
 	}
 	t.Skip("no Metal:", err)
+}
+
+func init() {
+	// Tests compare the specialized pipelines with the general ones, so frames
+	// make the pipelines they need first (TestFramesNeverWaitForACompile
+	// tests the other way).
+	syncPipelines = true
 }
 
 func TestDrawsAsTheCPURenderer(t *testing.T) {
@@ -432,7 +441,8 @@ func identityCases() []gputest.CullCase {
 		{Name: "window fills", Scene: gputest.FillScene(3456, 2000)}, {Name: "odd window fills", Scene: gputest.FillScene(2049, 1031)},
 		{Name: "reference scene", Scene: gputest.Scene()}, {Name: "transformed scene", Scene: gputest.TransformedScene()},
 		{Name: "perspective scene", Scene: gputest.PerspectiveScene()}, {Name: "axis clip scene", Scene: gputest.AxisClipScene()},
-		{Name: "continuous scene", Scene: gputest.ContinuousScene()}}
+		{Name: "continuous scene", Scene: gputest.ContinuousScene()},
+		{Name: "canvas scene", Scene: gputest.CanvasScene()}}
 	cases = append(cases, gputest.CullCases()...)
 	for _, c := range gputest.RingCases() {
 		cases = append(cases, gputest.CullCase{Name: "ring " + c.Name, Scene: c.Scene})
@@ -451,6 +461,57 @@ func identityCases() []gputest.CullCase {
 		cases = append(cases, gputest.CullCase{Name: c.Name + " (transformed scene)", Scene: gputest.Transformed(c.Scene)})
 	}
 	return cases
+}
+
+// TestClassesDrawTheSamePixels draws every scene with a fragment function
+// specialized for each batch (gpu.Class) and with the general one, in BGRA8
+// and float16 targets, and requires the same bytes.
+func TestClassesDrawTheSamePixels(t *testing.T) {
+	r, err := newRenderer()
+	if err != nil {
+		unavailable(t, err)
+	}
+	defer r.Release()
+	var seen [gpu.NumClasses]int
+	for _, wide := range []bool{false, true} {
+		if wide && !r.SetWide(true) {
+			t.Log("no wide target:", r.wideErr)
+			continue
+		}
+		for _, c := range shaderIdentityCases() {
+			r.b.NoClasses = false
+			special := renderRaw(t, r, c.Scene, wide)
+			var classes [gpu.NumClasses]int
+			for _, bt := range r.b.Batches {
+				classes[bt.Class]++
+			}
+			r.b.NoClasses = true
+			c.Scene.EachCanvas(func(c *scene.Image) { c.Changed() })
+			general := renderRaw(t, r, c.Scene, wide)
+			for k, n := range classes {
+				seen[k] += n
+			}
+			if d := differing(special, general); d != 0 {
+				t.Errorf("%s wide=%v: %d bytes differ between specialized and general shaders (classes %v)", c.Name, wide, d, classes)
+			}
+		}
+	}
+	for k, n := range seen {
+		if n == 0 {
+			t.Errorf("no batch of class %d was drawn", k)
+		}
+		// The test proves nothing if a specialized pipeline did not build and
+		// the frames drew with the general one in its place.
+		cl := gpu.Class(k)
+		if cl != gpu.ClassGeneral && specializable(pixelFormatBGRA8Unorm, cl, blendOver) &&
+			!r.usedSpecialized(pipeKey{pixelFormatBGRA8Unorm, cl, false, blendOver}) && !r.usedSpecialized(pipeKey{pixelFormatBGRA8Unorm, cl, true, blendOver}) {
+			t.Errorf("class %d drew with no specialized pipeline", k)
+		}
+	}
+	if built, failed := r.pipelineCounts(); failed != 0 || built == 0 {
+		t.Errorf("%d specialized pipelines built, %d failed", built, failed)
+	}
+	r.b.NoClasses = false
 }
 
 // TestSplitsDrawTheSamePixels draws every identity case with the shadow and
@@ -485,6 +546,112 @@ func TestSplitsDrawTheSamePixels(t *testing.T) {
 		t.Error("nothing was split")
 	}
 	r.b.NoRingSplit, r.b.NoShadowSplit = false, false
+}
+
+// TestFramesNeverWaitForACompile checks that a frame whose batches need a
+// specialized pipeline that is not made yet draws with the general one at
+// once, whatever the compile takes, that the worker then makes it and later
+// frames use it, drawing the same pixels, and that a second renderer of the
+// device finds the pipelines made.
+func TestFramesNeverWaitForACompile(t *testing.T) {
+	syncPipelines = false
+	defer func() { syncPipelines = true }()
+	// Other tests made pipelines the device's cache holds: start empty.
+	pipeCache.Lock()
+	for k, pipe := range pipeCache.m {
+		release(&pipe)
+		delete(pipeCache.m, k)
+	}
+	pipeCache.Unlock()
+	r, err := newRenderer()
+	if err != nil {
+		unavailable(t, err)
+	}
+	defer r.Release()
+	// Slow enough that a frame waiting for it would show.
+	delay := 250 * time.Millisecond
+	r.pipes.delay = delay
+	s := gputest.OpaqueScene(900, 700)
+	var first, second []byte
+	t0 := time.Now()
+	first = renderRaw(t, r, s, false)
+	if d := time.Since(t0); d > delay/2 {
+		t.Fatalf("the first frame took %v: it waited for a compile of %v", d, delay)
+	}
+	f := r.cur
+	if p := r.pipeFor(f, gpu.ClassGlyph, true, blendOver); p != f.pipeline {
+		t.Error("a pipeline that is not made yet is not the general one")
+	}
+	// The worker makes them, one after the other; wait for the plain fill's.
+	plain := f.pipeline
+	for i := 0; i < 200 && plain == f.pipeline; i++ {
+		time.Sleep(50 * time.Millisecond)
+		r.pipes.mu.Lock()
+		r.pipes.delay = 0
+		r.pipes.mu.Unlock()
+		plain = r.pipeFor(f, gpu.ClassPlain, false, blendOver)
+		if plain == 0 {
+			t.Fatal("no pipeline")
+		}
+		if plain != f.pipeline {
+			break
+		}
+	}
+	if plain == f.pipeline {
+		t.Fatal("the worker did not make the specialized pipeline")
+	}
+	second = renderRaw(t, r, s, false)
+	if d := differing(first, second); d != 0 {
+		t.Errorf("%d bytes differ between the frame drawn with the general pipelines and with the specialized ones", d)
+	}
+	// Another renderer of the device: the pipelines are in the cache.
+	r2, err := newRenderer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Release()
+	renderRaw(t, r2, s, false)
+	if p := r2.pipeFor(r2.cur, gpu.ClassPlain, false, blendOver); p == r2.cur.pipeline {
+		t.Error("a second renderer did not find the pipeline made by the first")
+	}
+}
+
+//go:embed testdata/shader_upstream.metal
+var upstreamShader string
+
+// TestMatchesTheUpstreamShader draws every identity case with the renderer as it
+// is, every optimization on, and with the shader of upstream f2eca9f7 (a copy in
+// testdata, compiled when the test runs) and a builder that does none of
+// them (no cull, no splits, no opaque cores, no classes, no clip skip), in BGRA8
+// and float16 targets, and requires the same bytes. It guards what the
+// knob-against-knob tests cannot: the restructured plain path, the early return
+// of frameOf and the guarded paths of the shader, against the old shader.
+func TestMatchesTheUpstreamShader(t *testing.T) {
+	r, err := newRenderer()
+	if err != nil {
+		unavailable(t, err)
+	}
+	defer r.Release()
+	ref, err := newRenderer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ref.Release()
+	ref.source = upstreamShader
+	ref.b.Opaque, ref.b.NoCull, ref.b.NoShadowSplit, ref.b.NoRingSplit, ref.b.NoClasses, ref.b.NoClipSkip = false, true, true, true, true, true
+	for _, wide := range []bool{false, true} {
+		if wide && !(r.SetWide(true) && ref.SetWide(true)) {
+			t.Log("no wide target:", r.wideErr)
+			continue
+		}
+		for _, c := range shaderIdentityCases() {
+			got := renderRaw(t, r, c.Scene, wide)
+			want := renderRaw(t, ref, c.Scene, wide)
+			if d := differing(got, want); d != 0 {
+				t.Errorf("%s wide=%v: %d bytes differ from the upstream shader", c.Name, wide, d)
+			}
+		}
+	}
 }
 
 // TestCullTransformedShadows draws a shadow under a transform, scaled, rotated,
@@ -596,4 +763,10 @@ func TestFastFillDrawsTheSamePixels(t *testing.T) {
 		}
 	}
 	r.b.GeneralFill, r.b.NoClipSkip = false, false
+}
+
+// Fractionally scaled pixel art uses different filtering in the CPU renderer.
+// Compare these scenes byte for byte with the current upstream GPU shader.
+func shaderIdentityCases() []gputest.CullCase {
+	return append(identityCases(), gputest.CullCase{Name: "pixelated sprites", Scene: gputest.SpriteScene(320, 240, 1.5, 2, 30)})
 }

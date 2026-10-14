@@ -344,6 +344,14 @@ type formatState struct {
 // Renderer draws scenes into a CAMetalLayer it adds to a view's layer.
 type Renderer struct {
 	device, queue, sampler id
+	// lib is the library of the shader, which the pipelines of the classes
+	// of batches are made from as they are first used.
+	lib id
+	// source, unless empty, is the shader's source for tests that draw with
+	// another (the upstream one), which has no function constants; pipes are the
+	// pipelines of the classes and the worker that makes them.
+	source string
+	pipes  pipeState
 	// formats has what draws into BGRA8 targets, as frames do, and into
 	// RGBA16Float ones, as frames showing colors outside the sRGB gamut do
 	// (SetWide), made for the first of those; cur is that of the target
@@ -449,6 +457,7 @@ func newRenderer() (r *Renderer, err error) {
 		return nil, err
 	}
 	r = &Renderer{images: map[uint64]*texture{}}
+	r.b.Classes = true
 	r.b.Opaque = true // Metal's GPUs discard what opaque cores cover
 	r.formats = [2]formatState{{format: pixelFormatBGRA8Unorm}, {format: pixelFormatRGBA16Float}}
 	r.cur = &r.formats[0]
@@ -500,15 +509,29 @@ func (r *Renderer) initGPU() error {
 
 // makePipelines makes the pipelines of f's format, or none.
 func (r *Renderer) makePipelines(f *formatState) (err error) {
-	var errObj id
-	lib := r.compiledLibrary()
-	if lib == 0 {
-		lib = send(r.device, "newLibraryWithSource:options:error:", nsString(shaderSource), 0, uintptr(unsafe.Pointer(&errObj)))
+	if r.lib == 0 {
+		var errObj id
+		var lib id
+		src := shaderSource
+		if r.source != "" {
+			src = r.source // a test's, never the compiled library
+		} else {
+			lib = r.compiledLibrary()
+		}
+		if lib == 0 {
+			lib = send(r.device, "newLibraryWithSource:options:error:", nsString(src), 0, uintptr(unsafe.Pointer(&errObj)))
+		}
+		if lib == 0 {
+			return fmt.Errorf("metal: cannot compile the shader: %s", describe(errObj))
+		}
+		r.lib = lib
 	}
-	if lib == 0 {
-		return fmt.Errorf("metal: cannot compile the shader: %s", describe(errObj))
-	}
-	defer release(&lib)
+	lib := r.lib
+	defer func() {
+		if err == nil {
+			r.startPipelines(f)
+		}
+	}()
 	defer func() {
 		if err != nil {
 			release(&f.pipeline)
@@ -596,12 +619,58 @@ const (
 // function vs and the fragment function fs of lib, blending premultiplied
 // colors over what is drawn, or as mode says.
 func (r *Renderer) newPipeline(lib id, fs string, format uint, mode blendMode) (id, error) {
+	return r.newClassPipeline(lib, fs, format, mode, gpu.ClassGeneral, true)
+}
+
+// classConstants are the function constants (the second, continuous corners,
+// being the batch's) (shader.metal) of each class
+// of batches: whether the fragment function has the code of instances under a
+// transform, continuous corners, plain fills, other fills, shadows, glyphs,
+// subpixel glyphs and images.
+var classConstants = [gpu.NumClasses][8]bool{
+	gpu.ClassPlain:    {2: true},
+	gpu.ClassFill:     {3: true},
+	gpu.ClassShadow:   {4: true},
+	gpu.ClassGlyph:    {5: true},
+	gpu.ClassSubpixel: {6: true},
+	gpu.ClassImage:    {7: true},
+}
+
+// specialized returns the function fs of lib with the constants of class cl
+// (owned). A function that has none (a library of an effect compiled before
+// they existed) is returned as it is; for the general class, the constants are
+// all true.
+func (r *Renderer) specialized(lib id, fs string, cl gpu.Class, continuous bool) (fn id, errObj id) {
+	if cl == gpu.ClassGeneral {
+		fn = send(lib, "newFunctionWithName:", nsString(fs))
+		if fn == 0 || send(send(fn, "functionConstantsDictionary"), "count") == 0 {
+			return fn, 0
+		}
+		release(&fn)
+	}
+	values := send(send(class("MTLFunctionConstantValues"), "alloc"), "init")
+	defer release(&values)
+	const dataTypeBool = 53
+	for i, on := range classConstants[cl] {
+		v := byte(0)
+		if on || cl == gpu.ClassGeneral || i == 1 && continuous {
+			v = 1
+		}
+		send(values, "setConstantValue:type:atIndex:", uintptr(unsafe.Pointer(&v)), dataTypeBool, uintptr(i))
+	}
+	fn = send(lib, "newFunctionWithName:constantValues:error:", nsString(fs), values, uintptr(unsafe.Pointer(&errObj)))
+	return fn, errObj
+}
+
+// newClassPipeline is newPipeline with the fragment function specialized for
+// the class cl.
+func (r *Renderer) newClassPipeline(lib id, fs string, format uint, mode blendMode, cl gpu.Class, continuous bool) (id, error) {
 	vsFn := send(lib, "newFunctionWithName:", nsString("vs"))
 	defer release(&vsFn)
-	fsFn := send(lib, "newFunctionWithName:", nsString(fs))
+	fsFn, fnErr := r.specialized(lib, fs, cl, continuous)
 	defer release(&fsFn)
 	if vsFn == 0 || fsFn == 0 {
-		return 0, fmt.Errorf("metal: the shader has no vs or %s", fs)
+		return 0, fmt.Errorf("metal: the shader has no vs or %s: %s", fs, describe(fnErr))
 	}
 	desc := send(send(class("MTLRenderPipelineDescriptor"), "alloc"), "init")
 	defer release(&desc)
@@ -837,6 +906,7 @@ func (r *Renderer) encode(s *scene.Scene, target id) (id, error) {
 	if err := r.syncAtlas(&r.color, s.ColorAtlas, pixelFormatRGBA8Unorm); err != nil {
 		return 0, err
 	}
+	r.pipes.fallbacks = 0
 	cb := send(r.queue, "commandBuffer")
 	if !r.checked {
 		if err := need(cb, "command buffer", "renderCommandEncoderWithDescriptor:", "commit", "presentDrawable:", "waitUntilScheduled", "waitUntilCompleted", "status", "blitCommandEncoder"); err != nil {
@@ -894,7 +964,10 @@ func (r *Renderer) drawCanvas(cb id, c *scene.Image) error {
 	cs := c.Scene
 	cs.Width, cs.Height = c.W, c.H
 	t.b.Wide = false
-	t.b.Opaque = r.b.Opaque
+	t.b.Opaque, t.b.Classes = r.b.Opaque, r.b.Classes
+	t.b.NoCull, t.b.NoShadowSplit, t.b.NoRingSplit = r.b.NoCull, r.b.NoShadowSplit, r.b.NoRingSplit
+	t.b.NoClasses, t.b.GeneralClasses = r.b.NoClasses, r.b.GeneralClasses
+	t.b.GeneralFill, t.b.NoClipSkip = r.b.GeneralFill, r.b.NoClipSkip
 	if err := r.drawInto(cb, cs, t.tex, &t.drawState); err != nil {
 		return err
 	}
@@ -937,16 +1010,18 @@ func (r *Renderer) drawInto(cb id, s *scene.Scene, target id, d *drawState) erro
 		if b.Count == 0 || sc.Empty() {
 			continue
 		}
-		want := r.cur.pipeline
+		var want id
 		switch {
 		case b.Effect != nil:
 			if want = r.effectPipeline(b.Effect); want == 0 {
 				continue
 			}
 		case b.Hole:
-			want = r.cur.holePipe
+			want = r.pipeFor(r.cur, b.Class, b.Continuous, blendHole)
 		case b.Opaque:
-			want = r.cur.opaquePipe
+			want = r.pipeFor(r.cur, b.Class, b.Continuous, blendNone)
+		default:
+			want = r.pipeFor(r.cur, b.Class, b.Continuous, blendOver)
 		}
 		if b.Backdrop != 0 {
 			// The effect shows what is drawn so far.
@@ -1234,6 +1309,7 @@ func (r *Renderer) releaseTextures() {
 		}
 	}
 	r.b.Release()
+	r.b.Classes = true
 	r.b.Opaque = true // Release empties the builder
 }
 
@@ -1336,6 +1412,7 @@ func (r *Renderer) Release() {
 		delete(trimTimers, r.trimHandle)
 		r.trimTimer = 0
 	}
+	r.stopPipelines()
 	pool(func() {
 		r.waitLast()
 		if r.layer != 0 {
@@ -1360,6 +1437,7 @@ func (r *Renderer) Release() {
 				release(&p.pipe)
 			}
 		}
+		release(&r.lib)
 		release(&r.queue)
 		release(&r.device)
 	})

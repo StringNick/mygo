@@ -130,6 +130,75 @@ type Batch struct {
 	// which writes the same bytes, and which lets a tile-based GPU
 	// discard whatever it drew under them before shading it.
 	Opaque bool
+	// Class is the paths of the shader that the batch's instances need
+	// (see Class), and Continuous whether any of them has continuous
+	// corners, in its shape or in the clip the shader cuts; renderers that do
+	// not specialize their shader ignore them.
+	Class      Class
+	Continuous bool
+}
+
+// Class says which paths of the fragment shader a batch's instances take.
+// Renderers specialize their shader for it (Metal's function constants, a
+// #define of GLSL, a macro of HLSL): the general shader holds the code of
+// every path, and registers for the heaviest, so the plain fills most of a
+// window is made of ran at a fraction of the speed it has without the rest.
+// A batch holds instances of one class.
+type Class uint8
+
+const (
+	// ClassGeneral is the whole shader; transformed instances, effects and
+	// anything else use it.
+	ClassGeneral Class = iota
+	// ClassPlain is fills that are solid, at opacity 1, without a border, not
+	// transformed.
+	ClassPlain
+	// ClassFill is the other fills (gradients, stripes, borders, dashes), not
+	// transformed.
+	ClassFill
+	// ClassShadow is shadows, ClassGlyph mask glyphs, ClassSubpixel
+	// subpixel glyphs and ClassImage images and color glyphs, not transformed.
+	ClassShadow
+	ClassGlyph
+	ClassSubpixel
+	ClassImage
+	// NumClasses is how many classes there are.
+	NumClasses
+)
+
+// classOf returns the class of an instance prepared for its clip, and whether
+// it has continuous corners (negative radii) that the shader draws, which
+// the general class always has the code for.
+func classOf(in *Instance) (Class, bool) {
+	if in.Transform0[3] > 0.5 {
+		return ClassGeneral, false
+	}
+	neg := func(r [4]float32) bool { return r[0] < 0 || r[1] < 0 || r[2] < 0 || r[3] < 0 }
+	// The shader cuts the clip itself unless a mask or the builder does.
+	continuous := in.Transform1[3] == 0 && neg(in.ClipRadii)
+	switch in.Params[0] {
+	case 0:
+		continuous = continuous || neg(in.Radii) || neg(in.Inner)
+		// Plain fills take the shader's own path (see its kPlain), for which
+		// the opacity is 1: at another the compiler fuses the product of
+		// the specialized function differently, and a result at a rounding
+		// tie differs by a level.
+		if in.Params[2] < 0.5 && in.Params[3] == 1 && !(in.UV[0] > 0 || in.UV[1] > 0 || in.UV[2] > 0 || in.UV[3] > 0) {
+			return ClassPlain, continuous
+		}
+		return ClassFill, continuous
+	case 1:
+		return ClassShadow, continuous || neg(in.Radii) || neg(in.Inner)
+	case 2:
+		return ClassGlyph, continuous
+	case 3:
+		return ClassImage, continuous
+	case 4:
+		return ClassImage, continuous || neg(in.Radii)
+	case 5:
+		return ClassSubpixel, continuous
+	}
+	return ClassGeneral, false
 }
 
 // Builder builds the instances and batches of scenes, reusing its memory
@@ -147,6 +216,14 @@ type Builder struct {
 	// NoRingSplit draws every border-only fill as one instance (see
 	// addFill), for tests that compare the two.
 	NoRingSplit bool
+	// NoClasses puts every batch in ClassGeneral, for tests and
+	// measurements that compare the specialized shaders with the general one.
+	NoClasses bool
+	// Classes separates batches for renderers with specialized fragment shaders.
+	Classes bool
+	// GeneralClasses has a bit (1 << Class) for each class that draws with the
+	// general shader, for tests that find which specialized one differs.
+	GeneralClasses uint32
 	// Opaque lets large opaque fills be drawn as an opaque core with blended
 	// edges around it (see addOpaque), which a renderer sets that gains from
 	// drawing the cores without blending (Metal's tile-based GPUs: hidden
@@ -479,14 +556,21 @@ func (b *Builder) add(in Instance, image uintptr, m scene.Affine) {
 	if in.Params[0] == 0 {
 		b.markFill(&in, m, cur)
 	}
+	class, continuous := b.classOf(&in)
 	n := len(b.Batches)
 	sc := b.batchScissor(cur)
-	if n == 0 || b.Batches[n-1].Scissor != sc || b.Batches[n-1].Effect != nil || b.Batches[n-1].Hole ||
-		b.Batches[n-1].Opaque != b.opaque || b.Batches[n-1].ClipMask != b.preparedMask ||
-		(image != 0 && b.Batches[n-1].Image != 0 && b.Batches[n-1].Image != image) {
-		b.Batches = append(b.Batches, Batch{Start: len(b.Instances), Scissor: sc, Image: image, ClipMask: b.preparedMask, Opaque: b.opaque})
+	same := n > 0 && b.Batches[n-1].Scissor == sc && b.Batches[n-1].Effect == nil && !b.Batches[n-1].Hole &&
+		b.Batches[n-1].Opaque == b.opaque && b.Batches[n-1].ClipMask == b.preparedMask && b.Batches[n-1].Class == class &&
+		!(image != 0 && b.Batches[n-1].Image != 0 && b.Batches[n-1].Image != image)
+	if same {
+		// Instances with and without continuous corners share a batch, with the
+		// code of those that need more.
+		b.Batches[n-1].Continuous = b.Batches[n-1].Continuous || continuous
+	} else {
+		b.Batches = append(b.Batches, Batch{Start: len(b.Instances), Scissor: sc, Image: image, ClipMask: b.preparedMask, Opaque: b.opaque, Class: class, Continuous: continuous})
 		n++
-	} else if image != 0 {
+	}
+	if image != 0 {
 		b.Batches[n-1].Image = image
 	}
 	b.Instances = append(b.Instances, in)
@@ -759,12 +843,30 @@ func (b *Builder) addHole(op *scene.Op) {
 	if !b.prepare(&in, op.Transform, cur) {
 		return
 	}
-	if n := len(b.Batches); n == 0 || !b.Batches[n-1].Hole || b.Batches[n-1].Scissor != cur.scissor ||
-		b.Batches[n-1].ClipMask != b.preparedMask {
-		b.Batches = append(b.Batches, Batch{Start: len(b.Instances), Scissor: cur.scissor, Hole: true, ClipMask: b.preparedMask})
+	class, continuous := b.classOf(&in)
+	n := len(b.Batches)
+	if n > 0 && b.Batches[n-1].Hole && b.Batches[n-1].Scissor == cur.scissor && b.Batches[n-1].ClipMask == b.preparedMask {
+		if b.Batches[n-1].Class != class {
+			b.Batches[n-1].Class = ClassGeneral // holes are few
+		}
+		b.Batches[n-1].Continuous = b.Batches[n-1].Continuous || continuous
+	} else {
+		b.Batches = append(b.Batches, Batch{Start: len(b.Instances), Scissor: cur.scissor, Hole: true, ClipMask: b.preparedMask, Class: class, Continuous: continuous})
 	}
 	b.Instances = append(b.Instances, in)
 	b.Batches[len(b.Batches)-1].Count++
+}
+
+// classOf is classOf, or the general class under NoClasses.
+func (b *Builder) classOf(in *Instance) (Class, bool) {
+	if !b.Classes || b.NoClasses {
+		return ClassGeneral, false
+	}
+	c, cont := classOf(in)
+	if b.GeneralClasses&(1<<c) != 0 {
+		return ClassGeneral, false
+	}
+	return c, cont
 }
 
 func rect(r scene.Rect) [4]float32 { return [4]float32{r.X, r.Y, r.W, r.H} }
