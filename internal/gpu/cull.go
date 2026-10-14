@@ -79,6 +79,21 @@ func (b *Builder) planCull(s *scene.Scene) {
 	if b.NoCull || n < 2 {
 		return
 	}
+	// Sprite and glyph-only scenes have nothing that can hide an earlier op.
+	// Avoid their bounds pass and per-op planning storage entirely. This is
+	// deliberately conservative: clipping and wide alpha are checked below.
+	candidate := false
+	for i := range s.Ops {
+		op := &s.Ops[i]
+		if op.Kind == scene.OpFill && op.Paint == scene.PaintSolid && op.Color.A == 255 &&
+			!op.Transform.Set && (op.Opacity == 0 || op.Opacity == 1) {
+			candidate = true
+			break
+		}
+	}
+	if !candidate {
+		return
+	}
 	if cap(b.plan) < n {
 		b.plan = make([]cullInfo, n)
 	}

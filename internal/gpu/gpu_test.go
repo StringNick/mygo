@@ -525,3 +525,29 @@ func TestShaderCapabilitiesAreOptIn(t *testing.T) {
 		}
 	}
 }
+
+func TestCullDoesNotPlanSpriteOnlyScenes(t *testing.T) {
+	var b Builder
+	s := gputest.SpriteScene(1920, 1080, 1.5, 3, 1000)
+	b.Build(s, func(*scene.Image) uintptr { return 1 })
+	if b.Culled != 0 || len(b.Instances) != len(s.Ops) {
+		t.Fatalf("sprite-only scene: %d culled, %d instances for %d ops", b.Culled, len(b.Instances), len(s.Ops))
+	}
+	if cap(b.plan) != 0 {
+		t.Fatalf("sprite-only scene allocated %d planning records", cap(b.plan))
+	}
+	// A later covered frame must still plan, and returning to sprites must
+	// clear old culling decisions even though its planning pass is skipped.
+	covered := &scene.Scene{Width: 1920, Height: 1080, Ops: []scene.Op{
+		{Kind: scene.OpFill, Rect: scene.Rect{W: 1920, H: 1080}, Color: scene.Color{A: 255}},
+		{Kind: scene.OpFill, Rect: scene.Rect{W: 1920, H: 1080}, Color: scene.Color{R: 100, A: 255}},
+	}}
+	b.Build(covered, nil)
+	if b.Culled != 1 {
+		t.Fatalf("covered frame culled %d ops", b.Culled)
+	}
+	b.Build(s, func(*scene.Image) uintptr { return 1 })
+	if b.Culled != 0 || len(b.Instances) != len(s.Ops) {
+		t.Fatal("sprite frame retained the previous culling plan")
+	}
+}
