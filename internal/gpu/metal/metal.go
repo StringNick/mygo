@@ -305,14 +305,17 @@ type texture struct {
 // drawState is what drawing scenes into a target keeps from frame to
 // frame: a frame's, and each canvas's.
 type drawState struct {
-	b       gpu.Builder
-	instBuf id
-	instCap int
+	b gpu.Builder
+	// Each frame slot owns its instances, including those of canvases.
+	instBufs [ringSize]id
+	instCaps [ringSize]int
 }
 
 func (d *drawState) release() {
-	release(&d.instBuf)
-	d.instCap = 0
+	for i := range d.instBufs {
+		release(&d.instBufs[i])
+		d.instCaps[i] = 0
+	}
 	d.b.Release()
 }
 
@@ -385,11 +388,11 @@ type Renderer struct {
 	// canvases are the textures canvases are drawn into.
 	canvases map[uint64]*canvasTexture
 	frame    uint64
-	// last is the command buffer of the last frame, which the next waits
-	// for before it changes what the GPU reads.
-	last    id
-	err     error
-	checked bool
+	// Command buffers retain every resource used by their frame slot.
+	inflight    [ringSize]id
+	slot, inUse int
+	err         error
+	checked     bool
 
 	// lastRender is when the last frame drew; trimTimer trims the
 	// drawables once none has for a while, armed until it fires, and
@@ -833,6 +836,9 @@ func (r *Renderer) syncAtlas(t *texture, a *scene.Atlas, format uint) error {
 	if full {
 		rects = []image.Rectangle{image.Rect(0, 0, a.W, a.H)}
 	}
+	if len(rects) > 0 {
+		r.waitLast() // frames in flight read this texture
+	}
 	for _, rc := range rects {
 		src := a.Pix[(rc.Min.Y*a.W+rc.Min.X)*a.BPP:]
 		region := mtlRegion{X: uint(rc.Min.X), Y: uint(rc.Min.Y), W: uint(rc.Dx()), H: uint(rc.Dy()), D: 1}
@@ -868,6 +874,7 @@ func (r *Renderer) imageTexture(img *scene.Image) uintptr {
 		release(&t.tex)
 		t.tex, t.w, t.h, t.ver = tex, img.W, img.H, img.Version()
 	} else if t.ver != img.Version() {
+		r.waitLast() // frames in flight read this texture
 		msgReplaceRegion(t.tex, sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"), mtlRegion{W: uint(img.W), H: uint(img.H), D: 1}, 0, unsafe.Pointer(&img.Pix[0]), uint(img.W*4))
 		t.ver = img.Version()
 	}
@@ -875,17 +882,43 @@ func (r *Renderer) imageTexture(img *scene.Image) uintptr {
 	return t.tex
 }
 
-// waitLast waits for the GPU to finish the last frame, so that this one
-// can change the buffers and textures it read.
-func (r *Renderer) waitLast() {
-	if r.last == 0 {
+// ringSize bounds frames in flight. Each slot owns the main target's and
+// every canvas's instance buffer, so CPU encoding can overlap GPU drawing.
+// A slot is reused only after its previous frame completes; in-place atlas
+// and image updates wait for all slots. Two slots bound the extra queueing
+// when the GPU is slower than the display. Native presentation can still
+// wait for a drawable, independently of these buffers.
+const ringSize = 2
+
+// waitSlot waits for the GPU to finish the frame that last used the slot's
+// instance buffer.
+func (r *Renderer) waitSlot(slot int) {
+	cb := r.inflight[slot]
+	if cb == 0 {
 		return
 	}
-	send(r.last, "waitUntilCompleted")
-	if int(send(r.last, "status")) == statusError && r.err == nil {
-		r.err = fmt.Errorf("metal: a frame failed: %s", describe(send(r.last, "error")))
+	send(cb, "waitUntilCompleted")
+	if int(send(cb, "status")) == statusError && r.err == nil {
+		r.err = fmt.Errorf("metal: a frame failed: %s", describe(send(cb, "error")))
 	}
-	release(&r.last)
+	release(&r.inflight[slot])
+}
+
+// waitLast waits for the GPU to finish the frames in flight, so that this
+// one can change the textures they read, or the renderer free what they use.
+func (r *Renderer) waitLast() {
+	for i := range r.inflight {
+		// The newest first: the queue finishes frames in order, so the
+		// others are done when it is.
+		r.waitSlot((r.slot + ringSize - 1 - i) % ringSize)
+	}
+}
+
+// track records cb, committed, as the frame drawn with the instance buffer
+// encode used, and moves on to the next.
+func (r *Renderer) track(cb id) {
+	r.inflight[r.inUse] = send(cb, "retain")
+	r.slot = (r.inUse + 1) % ringSize
 }
 
 // encode encodes drawing s into target, returning the autoreleased
@@ -898,6 +931,11 @@ func (r *Renderer) encode(s *scene.Scene, target id) (id, error) {
 		if err := r.makePipelines(r.cur); err != nil {
 			return 0, err
 		}
+	}
+	r.inUse = r.slot
+	r.waitSlot(r.inUse)
+	if r.err != nil {
+		return 0, r.err
 	}
 	r.frame++
 	if err := r.syncAtlas(&r.mask, s.MaskAtlas, pixelFormatR8Unorm); err != nil {
@@ -979,18 +1017,20 @@ func (r *Renderer) drawCanvas(cb id, c *scene.Image) error {
 func (r *Renderer) drawInto(cb id, s *scene.Scene, target id, d *drawState) error {
 	d.b.ClipSkip = true
 	s = d.b.Build(s, r.imageTexture)
-	if n := len(d.b.Instances); n > d.instCap {
-		release(&d.instBuf)
+	instBuf := &d.instBufs[r.inUse]
+	instCap := &d.instCaps[r.inUse]
+	if n := len(d.b.Instances); n > *instCap {
+		release(instBuf)
 		capacity := max(n*3/2, 1024)
-		d.instBuf = send(r.device, "newBufferWithLength:options:", uintptr(capacity*gpu.InstanceSize), 0) // shared storage
-		if d.instBuf == 0 {
-			d.instCap = 0
+		*instBuf = send(r.device, "newBufferWithLength:options:", uintptr(capacity*gpu.InstanceSize), 0) // shared storage
+		if *instBuf == 0 {
+			*instCap = 0
 			return errors.New("metal: cannot create the instance buffer")
 		}
-		d.instCap = capacity
+		*instCap = capacity
 	}
 	if n := len(d.b.Instances); n > 0 {
-		dst := unsafe.Slice((*gpu.Instance)(ptr(send(d.instBuf, "contents"))), n)
+		dst := unsafe.Slice((*gpu.Instance)(ptr(send(*instBuf, "contents"))), n)
 		copy(dst, d.b.Instances)
 	}
 
@@ -1043,8 +1083,8 @@ func (r *Renderer) drawInto(cb id, s *scene.Scene, target id, d *drawState) erro
 		}
 		send(enc, "setFragmentTexture:atIndex:", or(id(b.ClipMask), r.empty), 4)
 		offset := uintptr(b.Start * gpu.InstanceSize)
-		send(enc, "setVertexBuffer:offset:atIndex:", d.instBuf, offset, 0)
-		send(enc, "setFragmentBuffer:offset:atIndex:", d.instBuf, offset, 0)
+		send(enc, "setVertexBuffer:offset:atIndex:", *instBuf, offset, 0)
+		send(enc, "setFragmentBuffer:offset:atIndex:", *instBuf, offset, 0)
 		msgSetScissor(enc, sel("setScissorRect:"), mtlScissorRect{uint(sc.Left), uint(sc.Top), uint(sc.Right - sc.Left), uint(sc.Bottom - sc.Top)})
 		send(enc, "drawPrimitives:vertexStart:vertexCount:instanceCount:", primitiveTriStrip, 0, 4, uintptr(b.Count))
 	}
@@ -1185,7 +1225,6 @@ func (r *Renderer) Render(s *scene.Scene) (err error) {
 const behindAfter = 4 * time.Millisecond
 
 func (r *Renderer) render(s *scene.Scene) error {
-	r.waitLast()
 	if r.err != nil {
 		return r.err
 	}
@@ -1244,7 +1283,7 @@ func (r *Renderer) render(s *scene.Scene) error {
 		send(cb, "presentDrawable:", drawable)
 		send(cb, "commit")
 	}
-	r.last = send(cb, "retain")
+	r.track(cb)
 	r.lastRender = time.Now()
 	r.armTrim()
 	// Forget the textures of images no frame drew for a while, and those
@@ -1300,8 +1339,7 @@ func (r *Renderer) releaseTextures() {
 		t.drawState.release()
 		delete(r.canvases, key)
 	}
-	release(&r.instBuf)
-	r.instCap = 0
+	r.drawState.release()
 	for i := range r.formats {
 		for j := range r.formats[i].backdrop {
 			release(&r.formats[i].backdrop[j].tex)

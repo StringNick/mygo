@@ -770,3 +770,113 @@ func TestFastFillDrawsTheSamePixels(t *testing.T) {
 func shaderIdentityCases() []gputest.CullCase {
 	return append(identityCases(), gputest.CullCase{Name: "pixelated sprites", Scene: gputest.SpriteScene(320, 240, 1.5, 2, 30)})
 }
+
+// TestFramesInFlight encodes and commits frames one after the other without
+// waiting for the GPU (as Render does, with a ring of instance buffers), among
+// them frames that change an atlas and an image in place, which waits for the
+// frames in flight, and requires each frame to have the pixels it has when
+// drawn alone.
+func TestFramesInFlight(t *testing.T) {
+	r, err := newRenderer()
+	if err != nil {
+		unavailable(t, err)
+	}
+	defer r.Release()
+	const frames = 12
+	const w, h = 480, 360
+	img := scene.NewImageRGBA(8, 8, make([]byte, 8*8*4))
+	s := gputest.OpaqueScene(w, h)
+	x, y, _ := s.MaskAtlas.Alloc(16, 16)
+	s.Glyphs = append(s.Glyphs, scene.Glyph{X: 300, Y: 300, W: 16, H: 16, U: uint16(x), V: uint16(y), UW: 16, VH: 16, Color: scene.Color{A: 255}})
+	s.Ops = append(s.Ops, scene.Op{Kind: scene.OpImage, Rect: scene.Rect{X: 20, Y: 250, W: 80, H: 80}, Image: img, Src: scene.Rect{W: 8, H: 8}},
+		scene.Op{Kind: scene.OpGlyphs, Start: int32(len(s.Glyphs) - 1), End: int32(len(s.Glyphs))},
+		scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 30, Y: 40, W: 200, H: 150}, Radii: [4]float32{12, 12, 12, 12}, Color: scene.Color{G: 120, B: 200, A: 255}})
+	last := len(s.Ops) - 1
+	canvas := scene.NewCanvas(160, 100)
+	canvas.Scene.Ops = []scene.Op{{Kind: scene.OpFill, Rect: scene.Rect{W: 160, H: 100}, Color: scene.Color{R: 40, A: 255}},
+		{Kind: scene.OpFill, Rect: scene.Rect{X: 10, Y: 10, W: 40, H: 40}, Color: scene.Color{G: 220, A: 255}}}
+	s.Ops = append(s.Ops, scene.Op{Kind: scene.OpImage, Rect: scene.Rect{X: 300, Y: 20, W: 160, H: 100}, Image: canvas, Src: scene.Rect{W: 160, H: 100}})
+	// step makes frame i: the fill moves, and the atlas and the image change
+	// in place, the atlas at the frames 4 and 8, the image at 5 and 9.
+	step := func(i int) {
+		canvas.Scene.Ops[1].Rect.X = 10 + float32(i)*7
+		canvas.Scene.Ops[1].Color.R = byte(i * 20)
+		canvas.Changed()
+		s.Ops[last].Rect.X = 30 + float32(i)*20
+		s.Ops[last].Color.R = byte(20 * i)
+		if i%4 == 0 {
+			pix := make([]byte, 16*16)
+			for k := range pix {
+				pix[k] = byte(k*i + 1)
+			}
+			s.MaskAtlas.Put(x, y, 16, 16, pix, 16)
+		}
+		if i%4 == 1 {
+			for k := range img.Pix {
+				img.Pix[k] = byte(k * (i + 3))
+			}
+			img.Changed()
+		}
+	}
+	want := make([][]byte, frames)
+	for i := range want { // each frame drawn alone and waited for
+		step(i)
+		if want[i], err = r.renderOffscreen(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A new renderer, so that its textures are made as the frames in flight
+	// find them.
+	r2, err := newRenderer()
+	if err != nil {
+		unavailable(t, err)
+	}
+	defer r2.Release()
+	clear(img.Pix) // as the first frame had it
+	img.Changed()
+	got := make([][]byte, frames)
+	var targets [frames]id
+	pool(func() {
+		r2.cur = &r2.formats[0]
+		for i := range targets {
+			step(i)
+			targets[i] = r2.newTexture(w, h, pixelFormatBGRA8Unorm, usageRenderTarget|usageShaderRead, nil, 0)
+			cb, err := r2.encode(s, targets[i])
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			send(cb, "commit")
+			r2.track(cb)
+		}
+		r2.waitLast()
+		if r2.err != nil {
+			t.Error(r2.err)
+			return
+		}
+		for i := range targets {
+			cb := send(r2.queue, "commandBuffer")
+			blit := send(cb, "blitCommandEncoder")
+			send(blit, "synchronizeResource:", targets[i])
+			send(blit, "endEncoding")
+			send(cb, "commit")
+			send(cb, "waitUntilCompleted")
+			got[i] = make([]byte, w*h*4)
+			msgGetBytes(targets[i], sel("getBytes:bytesPerRow:fromRegion:mipmapLevel:"), unsafe.Pointer(&got[i][0]), uint(w*4),
+				mtlRegion{W: w, H: h, D: 1}, 0)
+			release(&targets[i])
+		}
+	})
+	for i := range got {
+		if got[i] == nil {
+			t.Errorf("frame %d was not rendered", i)
+			continue
+		}
+		if d := differing(got[i], want[i]); d != 0 {
+			t.Errorf("frame %d: %d bytes differ from drawing it alone", i, d)
+		}
+	}
+	if differing(want[0], want[1]) == 0 || differing(want[3], want[4]) == 0 || differing(want[4], want[5]) == 0 {
+		t.Error("the frames do not differ: the test checks nothing")
+	}
+}
