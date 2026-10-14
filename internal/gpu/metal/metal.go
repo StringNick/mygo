@@ -1480,3 +1480,12 @@ func (r *Renderer) Release() {
 		release(&r.device)
 	})
 }
+
+// FrameInfo describes the last frame for MYGO_FRAME_STATS.
+func (r *Renderer) FrameInfo() string {
+	info := r.b.Summary()
+	if n := r.pipes.fallbacks; n > 0 {
+		info += fmt.Sprintf(", %d batches awaiting specialized pipelines", n)
+	}
+	return info
+}
