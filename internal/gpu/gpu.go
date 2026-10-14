@@ -124,6 +124,12 @@ type Batch struct {
 	// Hole tells that the batch's instances make their shapes transparent
 	// (scene.OpHole): renderers blend them with a source factor of zero.
 	Hole bool
+	// Opaque tells that every fragment the batch's instances draw within
+	// its scissor rectangle is opaque, with coverage exactly 1 (the cores of
+	// opaque fills, see addOpaque): renderers may draw it without blending,
+	// which writes the same bytes, and which lets a tile-based GPU
+	// discard whatever it drew under them before shading it.
+	Opaque bool
 }
 
 // Builder builds the instances and batches of scenes, reusing its memory
@@ -141,6 +147,12 @@ type Builder struct {
 	// NoRingSplit draws every border-only fill as one instance (see
 	// addFill), for tests that compare the two.
 	NoRingSplit bool
+	// Opaque lets large opaque fills be drawn as an opaque core with blended
+	// edges around it (see addOpaque), which a renderer sets that gains from
+	// drawing the cores without blending (Metal's tile-based GPUs: hidden
+	// surfaces are discarded): the others would only draw more calls for the
+	// same pixels. Tests and measurements switch it to compare the two.
+	Opaque bool
 	// NoCull draws every op, even those that later opaque fills cover whole
 	// (see planCull), for tests that compare the two.
 	NoCull bool
@@ -151,13 +163,14 @@ type Builder struct {
 	// ClipSkip enables the clip-coverage flag understood by the Metal shader.
 	ClipSkip bool
 	// Culled is how many ops the last Build left out as covered.
-	Culled       int
-	culled       []bool
-	plan         []cullInfo
-	planStack    []clip
-	split        bool
-	splitScissor Scissor
-	stack        []clip
+	Culled, OpaqueCores int
+	opaque              bool
+	culled              []bool
+	plan                []cullInfo
+	planStack           []clip
+	split               bool
+	splitScissor        Scissor
+	stack               []clip
 	// encloses tells, for each op of the scene, that it pushes a clip with
 	// a transformed op or glyph inside it.
 	encloses     []bool
@@ -255,6 +268,7 @@ func (b *Builder) Build(s *scene.Scene, image func(*scene.Image) uintptr) *scene
 	b.Instances = b.Instances[:0]
 	b.Batches = b.Batches[:0]
 	b.Backdrops = b.Backdrops[:0]
+	b.OpaqueCores = 0
 	everything := scene.Rect{X: -1e6, Y: -1e6, W: 2e6, H: 2e6}
 	b.stack = append(b.stack[:0], clip{rect: everything, bounds: scene.Rect{W: float32(s.Width), H: float32(s.Height)},
 		scissor: Scissor{0, 0, int32(s.Width), int32(s.Height)}})
@@ -296,7 +310,7 @@ func (b *Builder) Build(s *scene.Scene, image func(*scene.Image) uintptr) *scene
 				dashed = 1
 			}
 			w := b.wideOf(s, op.Wide)
-			b.addFill(Instance{
+			b.addFill(s, Instance{
 				Rect: rect(op.Rect), Radii: radii, Inner: inner,
 				Color: wideColor(w, scene.WideColor, op.Color), Color2: wideColor(w, scene.WideColor2, op.Color2), Border: wideColor(w, scene.WideBorder, op.BorderColor), Grad: op.Gradient,
 				UV:     bw,
@@ -468,9 +482,9 @@ func (b *Builder) add(in Instance, image uintptr, m scene.Affine) {
 	n := len(b.Batches)
 	sc := b.batchScissor(cur)
 	if n == 0 || b.Batches[n-1].Scissor != sc || b.Batches[n-1].Effect != nil || b.Batches[n-1].Hole ||
-		b.Batches[n-1].ClipMask != b.preparedMask ||
+		b.Batches[n-1].Opaque != b.opaque || b.Batches[n-1].ClipMask != b.preparedMask ||
 		(image != 0 && b.Batches[n-1].Image != 0 && b.Batches[n-1].Image != image) {
-		b.Batches = append(b.Batches, Batch{Start: len(b.Instances), Scissor: sc, Image: image, ClipMask: b.preparedMask})
+		b.Batches = append(b.Batches, Batch{Start: len(b.Instances), Scissor: sc, Image: image, ClipMask: b.preparedMask, Opaque: b.opaque})
 		n++
 	} else if image != 0 {
 		b.Batches[n-1].Image = image
@@ -612,6 +626,27 @@ func (b *Builder) batchScissor(cur *clip) Scissor {
 	return cur.scissor
 }
 
+// opaqueMin is the area, in pixels, below which a fill is not drawn as an
+// opaque core with edges around it: a draw call costs more than the
+// overdraw it saves.
+const opaqueMin = 16384
+
+// addOpaque appends the instance of an opaque fill as one instance in a
+// batch of opaque cores, scissored to core (what occluderOf finds the fill to
+// paint with its own opaque color, coverage 1 and alpha 1: blending leaves
+// nothing of the destination there, so renderers write the shader's color as
+// it is), and as up to four blended pieces around it, for the antialiased
+// edge and the corners. The pixels are the same as drawing it whole.
+func (b *Builder) addOpaque(in Instance, m scene.Affine, core Scissor) {
+	b.scissorBatches(core, true)
+	b.opaque = true
+	b.add(in, 0, m)
+	b.scissorBatches(Scissor{}, false)
+	b.opaque = false
+	b.OpaqueCores++
+	b.addAround(in, m, core)
+}
+
 // worthSplitting reports whether drawing around core, a draw call for each
 // side, beats shading it: core within the quad is large, and a fair part of
 // the quad.
@@ -643,8 +678,23 @@ func ringCore(r scene.Rect, radii, bw [4]float32, continuous bool) Scissor {
 // difference, and the color is transparent. Without it a 2 pixel ring around
 // a 5 Mpx panel shaded the whole panel, twice over, through the general
 // path. The pixels are identical.
-func (b *Builder) addFill(in Instance, op *scene.Op) {
+//
+// An opaque fill with a large core is drawn as that core, in a batch
+// renderers draw without blending, and blended pieces around it (addOpaque).
+func (b *Builder) addFill(s *scene.Scene, in Instance, op *scene.Op) {
 	cur := &b.stack[len(b.stack)-1]
+	if b.Opaque && in.Color[3] == 1 && !op.Rect.Empty() && !cur.scissor.Empty() {
+		if core := b.occluderOf(s, op, cur); !core.Empty() {
+			quad := Scissor{
+				Left: int32(math.Floor(float64(op.Rect.X - 1))), Top: int32(math.Floor(float64(op.Rect.Y - 1))),
+				Right: int32(math.Ceil(float64(op.Rect.X + op.Rect.W + 1))), Bottom: int32(math.Ceil(float64(op.Rect.Y + op.Rect.H + 1))),
+			}.intersect(cur.scissor)
+			if a := core.area(); a >= opaqueMin && 2*a >= quad.area() {
+				b.addOpaque(in, op.Transform, core)
+				return
+			}
+		}
+	}
 	if b.NoRingSplit || op.Transform.Set || op.Paint != scene.PaintSolid || in.Color[3] != 0 || !scene.HasBorder(in.UV) ||
 		op.Rect.Empty() || cur.scissor.Empty() {
 		b.add(in, 0, op.Transform)

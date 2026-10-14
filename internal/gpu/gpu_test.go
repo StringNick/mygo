@@ -349,6 +349,53 @@ func TestRingSplitShrinksTheShaded(t *testing.T) {
 	}
 }
 
+// TestOpaqueCores checks which fills the builder draws as opaque cores with
+// blended edges around them: a layer as large as the frame is one opaque
+// instance without edges, a card has a core and four edges that tile the
+// frame less it, and small, translucent and gradient fills stay blended.
+func TestOpaqueCores(t *testing.T) {
+	white := scene.Color{R: 255, G: 255, B: 255, A: 255}
+	s := &scene.Scene{Width: 800, Height: 600, Ops: []scene.Op{
+		{Kind: scene.OpFill, Rect: scene.Rect{W: 800, H: 600}, Color: white},
+		{Kind: scene.OpFill, Rect: scene.Rect{X: 100, Y: 100, W: 600, H: 400}, Radii: [4]float32{16, 16, 16, 16}, Color: white},
+		{Kind: scene.OpFill, Rect: scene.Rect{X: 10, Y: 10, W: 50, H: 50}, Color: white},
+		{Kind: scene.OpFill, Rect: scene.Rect{X: 10, Y: 10, W: 500, H: 500}, Color: scene.Color{R: 1, A: 254}},
+	}}
+	var b Builder
+	b.NoCull, b.Opaque = true, true
+	b.Build(s, nil)
+	if b.OpaqueCores != 2 {
+		t.Fatalf("%d opaque cores, want 2", b.OpaqueCores)
+	}
+	var core, blended int64
+	for _, bt := range b.Batches {
+		if bt.Opaque {
+			if bt.Count != 1 {
+				t.Errorf("an opaque batch has %d instances", bt.Count)
+			}
+			core += bt.Scissor.area()
+		} else {
+			blended += bt.Scissor.area() * int64(bt.Count)
+		}
+	}
+	card := shadowCore(scene.Rect{X: 100, Y: 100, W: 600, H: 400}, [4]float32{16, 16, 16, 16}, false)
+	if want := int64(800*600) + card.area(); core != want {
+		t.Errorf("opaque cores cover %d px, want %d", core, want)
+	}
+	// Blended: the card's four edges tile the frame less its core, and the
+	// small and the translucent fill are one instance each, scissored to the frame.
+	if want := int64(800*600) - card.area() + 2*800*600; blended != want {
+		t.Errorf("blended scissor area %d, want %d", blended, want)
+	}
+	b.Opaque = false
+	b.Build(s, nil)
+	for _, bt := range b.Batches {
+		if bt.Opaque {
+			t.Error("an opaque batch without Opaque")
+		}
+	}
+}
+
 // TestCullKeepsTransformedShadows checks that the planner does not leave out a
 // shadow under a transform whose blur reaches out of the cover over it: the blur
 // grows with the scale, so a shadow of blur 20 at scale 4 reaches about 120

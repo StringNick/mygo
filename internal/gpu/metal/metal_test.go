@@ -372,12 +372,65 @@ func TestRingSplitDrawsTheSamePixels(t *testing.T) {
 	r.b.NoRingSplit = false
 }
 
+// TestOpaqueCoreDrawsTheSamePixels draws fills as opaque cores, drawn without
+// blending, with blended edges around them, and whole and blended, in BGRA8
+// and float16 targets, with and without culling, and requires the same bytes
+// (and the CPU renderer's pixels).
+func TestOpaqueCoreDrawsTheSamePixels(t *testing.T) {
+	r, err := newRenderer()
+	if err != nil {
+		unavailable(t, err)
+	}
+	defer r.Release()
+	cases := identityCases()
+	cores := 0
+	for _, wide := range []bool{false, true} {
+		if wide && !r.SetWide(true) {
+			t.Log("no wide target:", r.wideErr)
+			continue
+		}
+		for _, noCull := range []bool{false, true} {
+			r.b.NoCull = noCull
+			for _, c := range cases {
+				r.b.Opaque = true
+				core := renderRaw(t, r, c.Scene, wide)
+				n, opaque := r.b.OpaqueCores, 0
+				for _, bt := range r.b.Batches {
+					if bt.Opaque {
+						opaque++
+					}
+				}
+				r.b.Opaque = false
+				blended := renderRaw(t, r, c.Scene, wide)
+				if n > 0 && opaque == 0 {
+					t.Errorf("%s: %d cores, no opaque batch", c.Name, n)
+				}
+				cores += n
+				if d := differing(core, blended); d != 0 {
+					t.Errorf("%s wide=%v noCull=%v: %d bytes differ between opaque cores and blended fills", c.Name, wide, noCull, d)
+				}
+				if !wide && !noCull && c.Scene.Width*c.Scene.Height < 1e6 {
+					gputest.Compare(t, "metal-opaque-"+c.Name, core, c.Scene.Width*4, c.Scene)
+				}
+			}
+		}
+	}
+	if cores == 0 {
+		t.Error("no fill was drawn as an opaque core")
+	}
+	r.b.NoCull, r.b.Opaque = false, true
+}
+
 // identityCases are the scenes of the identity tests of changes to how
 // scenes are drawn: the cases of the cull, ring and shadow tests, the
 // scenes of fills and opaque fills at window sizes, the reference scene and
 // the scenes of transformed content.
 func identityCases() []gputest.CullCase {
-	cases := []gputest.CullCase{{Name: "window fills", Scene: gputest.FillScene(3456, 2000)}, {Name: "odd window fills", Scene: gputest.FillScene(2049, 1031)}, {Name: "reference scene", Scene: gputest.Scene()}, {Name: "transformed scene", Scene: gputest.TransformedScene()},
+	cases := []gputest.CullCase{{Name: "opaque scene", Scene: gputest.OpaqueScene(900, 700)},
+		{Name: "window opaque scene", Scene: gputest.OpaqueScene(3456, 2000)},
+		{Name: "odd opaque scene", Scene: gputest.OpaqueScene(2049, 1031)},
+		{Name: "window fills", Scene: gputest.FillScene(3456, 2000)}, {Name: "odd window fills", Scene: gputest.FillScene(2049, 1031)},
+		{Name: "reference scene", Scene: gputest.Scene()}, {Name: "transformed scene", Scene: gputest.TransformedScene()},
 		{Name: "perspective scene", Scene: gputest.PerspectiveScene()}, {Name: "axis clip scene", Scene: gputest.AxisClipScene()},
 		{Name: "continuous scene", Scene: gputest.ContinuousScene()}}
 	cases = append(cases, gputest.CullCases()...)

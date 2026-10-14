@@ -488,6 +488,55 @@ func RingCases() []RingCase {
 	return out
 }
 
+// OpaqueScene returns a w×h scene (at least 600×500) of opaque fills large
+// enough for the builder to draw as cores without blending, over content that
+// shows if one is wrong: translucent shadows, glyphs and half transparent
+// fills under them, and fills with square, round and continuous corners, a
+// translucent border, fractional places, edges at the frame's, rectangular
+// clips with whole and fractional edges, and some that are not cores (half
+// opacity, a gradient, a rounded clip, a transformed fill).
+func OpaqueScene(w, h int) *scene.Scene {
+	s := &scene.Scene{Width: w, Height: h, Clear: scene.Color{R: 30, G: 34, B: 40, A: 255}}
+	s.MaskAtlas, s.Text, s.Glyphs = glyphContent()
+	fw, fh := float32(w), float32(h)
+	r4 := func(r float32) [4]float32 { return [4]float32{r, r, r, r} }
+	add := func(op scene.Op) { s.Ops = append(s.Ops, op) }
+	color := func(i int) scene.Color {
+		return scene.Color{R: byte(20 + i*37%200), G: byte(10 + i*53%220), B: byte(40 + i*71%200), A: 255}
+	}
+	under := func(x, y float32) {
+		add(scene.Op{Kind: scene.OpShadow, Rect: scene.Rect{X: x, Y: y, W: 160, H: 100}, Radii: r4(12), Color: scene.Color{A: 140}, Blur: 20})
+		add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: x + 20, Y: y + 20, W: 200, H: 80}, Color: scene.Color{R: 255, G: 90, B: 20, A: 160}})
+		add(scene.Op{Kind: scene.OpGlyphs, Start: 0, End: int32(len(s.Glyphs))})
+	}
+	under(fw/6, 80)
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{W: fw, H: fh}, Color: color(1)})
+	under(fw/6, 100)
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 40, Y: 30.25, W: fw - 80.5, H: fh - 60}, Radii: r4(24), Continuous: true, Color: color(2),
+		Border: scene.Uniform(2), BorderColor: scene.Color{R: 255, G: 255, B: 255, A: 70}})
+	under(fw/3, 200)
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 60.5, Y: 70, W: fw - 140, H: fh - 140.5}, Color: color(3)})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 100, Y: 90, W: fw/2 + 0.5, H: fh/2 - 3.25}, Radii: r4(12), Color: color(4)})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: fw / 3, Y: 120, W: fw / 2, H: fh / 2}, Radii: [4]float32{40, 0, 16, 5}, Color: color(5)})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: -5, Y: fh - 130, W: fw + 10, H: 130}, Color: color(6)})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 0, Y: 0, W: 150, H: fh}, Color: color(7)})
+	add(scene.Op{Kind: scene.OpPushClip, Rect: scene.Rect{X: 200, Y: 150, W: fw - 300, H: fh - 250}})
+	under(260, 200)
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 190, Y: 140, W: fw - 280, H: fh - 230}, Color: color(8)})
+	add(scene.Op{Kind: scene.OpPopClip})
+	add(scene.Op{Kind: scene.OpPushClip, Rect: scene.Rect{X: 210.5, Y: 160.25, W: fw - 320.5, H: fh - 270.25}})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 190, Y: 140, W: fw - 280, H: fh - 230}, Color: color(9)})
+	add(scene.Op{Kind: scene.OpPopClip})
+	add(scene.Op{Kind: scene.OpPushClip, Rect: scene.Rect{X: 220, Y: 170, W: fw - 340, H: fh - 290}, Radii: r4(30)})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 190, Y: 140, W: fw - 280, H: fh - 230}, Color: color(10)})
+	add(scene.Op{Kind: scene.OpPopClip})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 250, Y: 200, W: 300, H: 200}, Color: color(11), Opacity: 0.5})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 250, Y: 200, W: 300, H: 200}, Color: color(12), Color2: color(13), Paint: scene.PaintLinear, Gradient: [4]float32{250, 0, 550, 0}})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 260, Y: 210, W: 280, H: 180}, Color: color(14), Transform: scene.Scaling(1.01, 1)})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 300, Y: 250, W: 120, H: 90}, Color: color(15)}) // small: not a core
+	return s
+}
+
 // CullCase is a scene of ops, some of them under later opaque fills, and how
 // many of them a renderer may leave out, which must change no pixel. The
 // identity tests use it as a named scene.

@@ -330,8 +330,9 @@ type canvasTexture struct {
 type formatState struct {
 	format   uint
 	pipeline id
-	// holePipe draws holes (scene.OpHole), taking their coverage away.
-	holePipe id
+	// holePipe draws holes (scene.OpHole), taking their coverage away, and
+	// opaquePipe the cores of opaque fills (gpu.Batch.Opaque), without blending.
+	holePipe, opaquePipe id
 	// downPipe and blurPipe draw the passes computing the backdrops of
 	// effects, into the textures of backdrop, the second only along rows.
 	downPipe, blurPipe id
@@ -448,6 +449,7 @@ func newRenderer() (r *Renderer, err error) {
 		return nil, err
 	}
 	r = &Renderer{images: map[uint64]*texture{}}
+	r.b.Opaque = true // Metal's GPUs discard what opaque cores cover
 	r.formats = [2]formatState{{format: pixelFormatBGRA8Unorm}, {format: pixelFormatRGBA16Float}}
 	r.cur = &r.formats[0]
 	pool(func() { err = r.init() })
@@ -511,14 +513,25 @@ func (r *Renderer) makePipelines(f *formatState) (err error) {
 		if err != nil {
 			release(&f.pipeline)
 			release(&f.holePipe)
+			release(&f.opaquePipe)
 			release(&f.downPipe)
 			release(&f.blurPipe)
 		}
 	}()
-	if f.pipeline, err = r.newPipeline(lib, "ps", f.format, false); err != nil {
+	if f.pipeline, err = r.newPipeline(lib, "ps", f.format, blendOver); err != nil {
 		return err
 	}
-	if f.holePipe, err = r.newPipeline(lib, "ps", f.format, true); err != nil {
+	if f.holePipe, err = r.newPipeline(lib, "ps", f.format, blendHole); err != nil {
+		return err
+	}
+	if f.format == pixelFormatRGBA16Float {
+		// Opaque cores are exactly 1 in coverage only to within the rasterizer's
+		// interpolation of the fragment's position, whose noise (a unit in the
+		// last place of a half, in the columns where the position crosses a
+		// power of two) blending hides in the destination's alpha but a plain
+		// write keeps: float16 targets blend them, byte for byte as whole fills.
+		f.opaquePipe = send(f.pipeline, "retain")
+	} else if f.opaquePipe, err = r.newPipeline(lib, "ps", f.format, blendNone); err != nil {
 		return err
 	}
 	if f.downPipe, err = r.passPipeline(lib, "down", f.format); err != nil {
@@ -570,10 +583,19 @@ func (r *Renderer) setLayerWide(on bool) (changed bool) {
 	return true
 }
 
+// blendMode is how a pipeline blends the shader's colors with the target.
+type blendMode int
+
+const (
+	blendOver blendMode = iota // premultiplied colors over what is drawn
+	blendHole                  // takes the coverage of holes away
+	blendNone                  // none: writes the colors, for opaque cores
+)
+
 // newPipeline returns a pipeline drawing instances with the vertex
 // function vs and the fragment function fs of lib, blending premultiplied
-// colors over what is drawn, or for hole, taking their coverage away.
-func (r *Renderer) newPipeline(lib id, fs string, format uint, hole bool) (id, error) {
+// colors over what is drawn, or as mode says.
+func (r *Renderer) newPipeline(lib id, fs string, format uint, mode blendMode) (id, error) {
 	vsFn := send(lib, "newFunctionWithName:", nsString("vs"))
 	defer release(&vsFn)
 	fsFn := send(lib, "newFunctionWithName:", nsString(fs))
@@ -589,10 +611,14 @@ func (r *Renderer) newPipeline(lib id, fs string, format uint, hole bool) (id, e
 	send(ca, "setPixelFormat:", uintptr(format))
 	// Premultiplied colors over what is drawn.
 	src := uintptr(blendOne)
-	if hole {
+	if mode == blendHole {
 		src = blendZero
 	}
-	send(ca, "setBlendingEnabled:", 1)
+	if mode == blendNone {
+		send(ca, "setBlendingEnabled:", 0)
+	} else {
+		send(ca, "setBlendingEnabled:", 1)
+	}
 	send(ca, "setSourceRGBBlendFactor:", src)
 	// Dual-source blending: the shader's second color is the source's
 	// alpha of each channel.
@@ -639,7 +665,7 @@ func (r *Renderer) effectPipeline(e *scene.Effect) id {
 		}
 	}
 	if lib != 0 {
-		p.pipe, p.err = r.newPipeline(lib, "effect_ps", f.format, false)
+		p.pipe, p.err = r.newPipeline(lib, "effect_ps", f.format, blendOver)
 		release(&lib)
 	}
 	if p.err != nil && r.err == nil {
@@ -868,6 +894,7 @@ func (r *Renderer) drawCanvas(cb id, c *scene.Image) error {
 	cs := c.Scene
 	cs.Width, cs.Height = c.W, c.H
 	t.b.Wide = false
+	t.b.Opaque = r.b.Opaque
 	if err := r.drawInto(cb, cs, t.tex, &t.drawState); err != nil {
 		return err
 	}
@@ -918,6 +945,8 @@ func (r *Renderer) drawInto(cb id, s *scene.Scene, target id, d *drawState) erro
 			}
 		case b.Hole:
 			want = r.cur.holePipe
+		case b.Opaque:
+			want = r.cur.opaquePipe
 		}
 		if b.Backdrop != 0 {
 			// The effect shows what is drawn so far.
@@ -1205,7 +1234,7 @@ func (r *Renderer) releaseTextures() {
 		}
 	}
 	r.b.Release()
-	r.b = gpu.Builder{}
+	r.b.Opaque = true // Release empties the builder
 }
 
 // trimAfter is how long a window draws nothing before its spare drawables
@@ -1324,6 +1353,7 @@ func (r *Renderer) Release() {
 			f := &r.formats[i]
 			release(&f.pipeline)
 			release(&f.holePipe)
+			release(&f.opaquePipe)
 			release(&f.downPipe)
 			release(&f.blurPipe)
 			for _, p := range f.effects {
