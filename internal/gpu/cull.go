@@ -62,7 +62,8 @@ func shadowSupport(op *scene.Op) scene.Rect {
 	if op.Inset {
 		r = op.Cast
 	}
-	g := 2*op.Blur + 1
+	// Negative blur is a hard shadow, as Build clamps its sigma to zero.
+	g := 2*max(op.Blur, 0) + 1
 	return scene.Rect{X: r.X - g, Y: r.Y - g, W: r.W + 2*g, H: r.H + 2*g}
 }
 

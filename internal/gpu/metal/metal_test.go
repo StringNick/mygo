@@ -880,3 +880,28 @@ func TestFramesInFlight(t *testing.T) {
 		t.Error("the frames do not differ: the test checks nothing")
 	}
 }
+
+func TestCullKeepsHardShadowsWithNegativeBlur(t *testing.T) {
+	r, err := newRenderer()
+	if err != nil {
+		unavailable(t, err)
+	}
+	defer r.Release()
+	for _, inset := range []bool{false, true} {
+		shadow := scene.Op{Kind: scene.OpShadow, Rect: scene.Rect{X: 10, Y: 10, W: 100, H: 100}, Color: scene.Color{A: 255}, Blur: -10}
+		if inset {
+			shadow.Inset = true
+			shadow.Cast = shadow.Rect
+			shadow.Rect = scene.Rect{X: 20, Y: 20, W: 80, H: 80}
+		}
+		s := &scene.Scene{Width: 120, Height: 120, Clear: scene.Color{R: 255, G: 255, B: 255, A: 255}, Ops: []scene.Op{shadow, {Kind: scene.OpFill, Rect: scene.Rect{X: 25, Y: 25, W: 70, H: 70}, Color: scene.Color{R: 180, G: 180, B: 180, A: 255}}}}
+		r.b.NoCull = false
+		got := renderRaw(t, r, s, false)
+		n := r.b.Culled
+		r.b.NoCull = true
+		want := renderRaw(t, r, s, false)
+		if !bytes.Equal(got, want) {
+			t.Errorf("inset=%v culled=%d changed=%d bytes", inset, n, differing(got, want))
+		}
+	}
+}
