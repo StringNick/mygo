@@ -342,3 +342,170 @@ func ContinuousScene() *scene.Scene {
 	s.Effects = append(s.Effects, fx)
 	return s
 }
+
+// ShadowCase is a panel with a stack of shadows cast by it, as an elevated
+// surface has: its corner radius, the blur, spread and offset of each layer.
+type ShadowCase struct {
+	Radius     float32
+	Continuous bool
+	// Blur, Spread and DY describe each layer.
+	Blur, Spread, DY []float32
+}
+
+// ShadowPanelScene returns a 480×360 scene with a panel of 340×220 that casts
+// the shadows of c, each shown only outside the panel (Cast), as kit surfaces
+// draw them, and a fill over the panel.
+func ShadowPanelScene(c ShadowCase) *scene.Scene {
+	s := &scene.Scene{Width: 480, Height: 360, Clear: scene.Color{R: 240, G: 241, B: 244, A: 255}}
+	panel := scene.Rect{X: 70, Y: 60, W: 340, H: 220}
+	radii := [4]float32{c.Radius, c.Radius, c.Radius, c.Radius}
+	for i := range c.Blur {
+		sp := c.Spread[i]
+		box := scene.Rect{X: panel.X - sp, Y: panel.Y - sp + c.DY[i], W: panel.W + 2*sp, H: panel.H + 2*sp}
+		s.Ops = append(s.Ops, scene.Op{Kind: scene.OpShadow, Rect: box, Radii: radii, Continuous: c.Continuous,
+			Color: scene.Color{A: 60}, Blur: c.Blur[i], Cast: panel, CastRadii: radii})
+	}
+	s.Ops = append(s.Ops, scene.Op{Kind: scene.OpFill, Rect: panel, Radii: radii, Continuous: c.Continuous,
+		Color: scene.Color{R: 255, G: 255, B: 255, A: 255}})
+	return s
+}
+
+// ShadowCases are panels of several radii, blurs, spreads and offsets,
+// among them an offset larger than the blur and a shadow that does not reach
+// out of the panel.
+func ShadowCases() []ShadowCase {
+	return []ShadowCase{
+		{Radius: 0, Blur: []float32{2, 24}, Spread: []float32{0, 0}, DY: []float32{1, 12}},
+		{Radius: 12, Blur: []float32{2, 6, 12, 24}, Spread: []float32{0, -1, -3, -6}, DY: []float32{1, 3, 6, 12}},
+		{Radius: 40, Blur: []float32{16}, Spread: []float32{0}, DY: []float32{4}},
+		{Radius: 16, Continuous: true, Blur: []float32{12, 30}, Spread: []float32{2, 0}, DY: []float32{3, 8}},
+		{Radius: 8, Blur: []float32{4}, Spread: []float32{-2}, DY: []float32{40}},
+		{Radius: 60, Blur: []float32{8, 0}, Spread: []float32{0, 5}, DY: []float32{0, 0}},
+		{Radius: 30, Blur: []float32{60}, Spread: []float32{-40}, DY: []float32{-10}},
+	}
+}
+
+// CullCase is a scene of ops, some of them under later opaque fills, and how
+// many of them a renderer may leave out, which must change no pixel. The
+// identity tests use it as a named scene.
+type CullCase struct {
+	Name  string
+	Scene *scene.Scene
+	// Culled is how many ops the shared builder leaves out.
+	Culled int
+}
+
+// glyphContent returns a mask atlas holding a disc, the text parameters, and a run
+// of twelve glyphs of it, for scenes that draw text.
+func glyphContent() (*scene.Atlas, scene.TextParams, []scene.Glyph) {
+	atlas := scene.NewAtlas(1, 64, 64)
+	disc := make([]byte, 16*16)
+	for y := range 16 {
+		for x := range 16 {
+			dx, dy := float64(x)-7.5, float64(y)-7.5
+			disc[y*16+x] = byte(255 * clamp(7.5-math.Sqrt(dx*dx+dy*dy)))
+		}
+	}
+	x, y, _ := atlas.Alloc(16, 16)
+	atlas.Put(x, y, 16, 16, disc, 16)
+	var glyphs []scene.Glyph
+	for i := range 12 {
+		glyphs = append(glyphs, scene.Glyph{X: 40 + float32(i*16), Y: 120, W: 16, H: 16, U: uint16(x), V: uint16(y), UW: 16, VH: 16, Color: scene.Color{A: 255}})
+	}
+	return atlas, scene.TextParams{GammaRatios: scene.GammaRatios(1.8), Contrast: 1, SubpixelContrast: 0.5}, glyphs
+}
+
+// Transformed returns a copy of s with a one pixel transformed fill drawn
+// first, which makes the builder give rounded and rotated clips masks (a scene
+// with any transformed op has them), so that every case also runs with masked
+// clips.
+func Transformed(s *scene.Scene) *scene.Scene {
+	c := *s
+	c.Ops = append([]scene.Op{{Kind: scene.OpFill, Rect: scene.Rect{X: 1, Y: 1, W: 3, H: 3}, Color: scene.Color{R: 200, A: 255}, Transform: scene.Scaling(1.01, 1)}}, s.Ops...)
+	return &c
+}
+
+// MaskedCase is a named scene whose clips are masked.
+type MaskedCase struct {
+	Name  string
+	Scene *scene.Scene
+}
+
+// MaskedCases are scenes with rounded, continuous and rotated clips (which
+// are masks in a scene with a transformed op) holding what the builder
+// draws in pieces or as cores: a border-only ring, a shadow cast by a box, large
+// opaque fills, plain fills, glyphs and holes, with content after them in the
+// same clip that reaches the clip's corners.
+func MaskedCases() []MaskedCase {
+	r4 := func(r float32) [4]float32 { return [4]float32{r, r, r, r} }
+	build := func(name string, clip scene.Op, inner func(add func(scene.Op))) MaskedCase {
+		s := &scene.Scene{Width: 600, Height: 500, Clear: scene.Color{R: 240, G: 240, B: 240, A: 255}}
+		s.MaskAtlas, s.Text, s.Glyphs = glyphContent()
+		s.Ops = append(s.Ops, scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 5, Y: 5, W: 10, H: 10}, Color: scene.Color{R: 200, A: 255}, Transform: scene.Scaling(1.01, 1)})
+		s.Ops = append(s.Ops, scene.Op{Kind: scene.OpFill, Rect: scene.Rect{W: 600, H: 500}, Color: scene.Color{R: 90, G: 120, B: 200, A: 255}})
+		clip.Kind = scene.OpPushClip
+		s.Ops = append(s.Ops, clip)
+		inner(func(op scene.Op) { s.Ops = append(s.Ops, op) })
+		s.Ops = append(s.Ops, scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 0, Y: 0, W: 600, H: 120}, Color: scene.Color{G: 160, A: 200}},
+			scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 0, Y: 400, W: 600, H: 100}, Color: scene.Color{R: 160, A: 255}},
+			scene.Op{Kind: scene.OpGlyphs, Start: 0, End: int32(len(s.Glyphs))},
+			scene.Op{Kind: scene.OpPopClip})
+		return MaskedCase{name, s}
+	}
+	ring := func(add func(scene.Op)) {
+		add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 30, Y: 20, W: 540, H: 460}, Radii: r4(20), Border: scene.Uniform(3), BorderColor: scene.Color{B: 200, A: 255}})
+	}
+	shadow := func(add func(scene.Op)) {
+		add(scene.Op{Kind: scene.OpShadow, Rect: scene.Rect{X: 60, Y: 60, W: 400, H: 300}, Radii: r4(12), Color: scene.Color{A: 120}, Blur: 20,
+			Cast: scene.Rect{X: 60, Y: 60, W: 400, H: 300}, CastRadii: r4(12)})
+	}
+	opaque := func(add func(scene.Op)) {
+		add(scene.Op{Kind: scene.OpHole, Rect: scene.Rect{X: 200, Y: 200, W: 40, H: 40}})
+		add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 20, Y: 20, W: 560, H: 460}, Color: scene.Color{R: 250, G: 250, B: 250, A: 255}})
+		add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 50, Y: 50, W: 300, H: 300}, Radii: r4(16), Color: scene.Color{R: 30, G: 200, B: 90, A: 255}})
+		add(scene.Op{Kind: scene.OpHole, Rect: scene.Rect{X: 100, Y: 100, W: 40, H: 40}})
+		add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 80, Y: 80, W: 200, H: 200}, Color: scene.Color{R: 10, B: 90, A: 255}})
+	}
+	all := func(add func(scene.Op)) { shadow(add); ring(add); opaque(add) }
+	rounded := scene.Op{Rect: scene.Rect{X: 40, Y: 30, W: 520, H: 440}, Radii: r4(40)}
+	continuous := scene.Op{Rect: scene.Rect{X: 40, Y: 30, W: 520, H: 440}, Radii: r4(40), Continuous: true}
+	rotated := scene.Op{Rect: scene.Rect{X: 40, Y: 30, W: 520, H: 440}, Transform: scene.Rotation(3)}
+	return []MaskedCase{
+		build("masked ring", rounded, ring), build("masked shadow", rounded, shadow), build("masked opaque", rounded, opaque),
+		build("masked continuous", continuous, all), build("masked rotated", rotated, all), build("masked everything", rounded, all),
+	}
+}
+
+// WideScene returns a 600×500 scene with colors outside the sRGB gamut
+// (Scene.Wide, Op.Wide, Glyph.Wide) in large opaque fills, a ring, a gradient
+// glyph run inside a continuous rounded clip, and plain fills, which the
+// float16 targets of Metal keep and the others draw as their nearest sRGB
+// colors.
+func WideScene() *scene.Scene {
+	r4 := func(r float32) [4]float32 { return [4]float32{r, r, r, r} }
+	s := &scene.Scene{Width: 600, Height: 500, Clear: scene.Color{R: 30, G: 34, B: 40, A: 255}}
+	s.MaskAtlas, s.Text, s.Glyphs = glyphContent()
+	s.Wide = []scene.WideColors{
+		{Color: [4]float32{-0.25, 1.1, -0.1, 1}, Set: scene.WideColor},
+		{Color: [4]float32{1.15, -0.2, -0.1, 1}, Color2: [4]float32{-0.2, 0.3, 1.2, 1}, Set: scene.WideColor | scene.WideColor2},
+		{Border: [4]float32{1.2, 0.2, -0.1, 0.5}, Set: scene.WideBorder},
+		{Color: [4]float32{0.2, 1.2, 0.3, 0.5}, Set: scene.WideColor},
+	}
+	green, red := scene.Color{G: 255, A: 255}, scene.Color{R: 255, A: 255}
+	s.Glyphs = append([]scene.Glyph(nil), s.Glyphs...)
+	for i := range s.Glyphs {
+		s.Glyphs[i].Wide = 1
+	}
+	s.Ops = append(s.Ops,
+		scene.Op{Kind: scene.OpFill, Rect: scene.Rect{W: 600, H: 500}, Color: green, Wide: 1},
+		scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 30, Y: 30, W: 540, H: 440}, Radii: r4(24), Continuous: true, Color: green, Wide: 1,
+			Border: scene.Uniform(3), BorderColor: scene.Color{R: 255, A: 255}},
+		scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 20, Y: 20, W: 560, H: 460}, Radii: r4(16), Border: scene.Uniform(2), BorderColor: scene.Color{B: 255, A: 200}, Wide: 3},
+		scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 100, Y: 100, W: 300, H: 200}, Paint: scene.PaintOklab, Gradient: [4]float32{100, 0, 400, 0}, Color: green, Color2: red, Wide: 2},
+		scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 150, Y: 150, W: 300, H: 250}, Color: scene.Color{R: 60, G: 60, B: 255, A: 128}, Wide: 4},
+		scene.Op{Kind: scene.OpPushClip, Rect: scene.Rect{X: 60, Y: 60, W: 400, H: 300}, Radii: r4(30), Continuous: true},
+		scene.Op{Kind: scene.OpGlyphs, Start: 0, End: int32(len(s.Glyphs)), Paint: scene.PaintOklab, Gradient: [4]float32{40, 0, 240, 0}, Color: green, Color2: red, Wide: 2},
+		scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 70, Y: 200, W: 380, H: 100}, Color: red, Wide: 1},
+		scene.Op{Kind: scene.OpPopClip})
+	return s
+}

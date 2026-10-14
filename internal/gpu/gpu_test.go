@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/egoist/mygo/internal/gpu/gputest"
 	"github.com/egoist/mygo/internal/scene"
 )
 
@@ -180,5 +181,137 @@ func TestRoundedClipMasksOnlyTheBranchWithATransform(t *testing.T) {
 	}
 	if b.Instances[1].Transform1[3] != 0 || b.Batches[len(b.Batches)-1].ClipMask != 0 {
 		t.Fatal("untransformed row was masked")
+	}
+}
+
+// shadowFragments is the area, in pixels, the scissor rectangles of the
+// batches of the shadows (kind 1) leave to the renderer to shade.
+func shadowFragments(b *Builder) (area int64, instances int) {
+	for _, bt := range b.Batches {
+		for _, in := range b.Instances[bt.Start : bt.Start+bt.Count] {
+			if in.Params[0] == 1 {
+				area += bt.Scissor.area()
+				instances++
+			}
+		}
+	}
+	return
+}
+
+// TestShadowSplitShrinksTheShaded checks that a large shadow cast by a box is
+// drawn around that box: the scissor rectangles of its pieces tile the window
+// less the core of the box, so no fragment of the core is shaded, and a small
+// shadow stays one instance.
+func TestShadowSplitShrinksTheShaded(t *testing.T) {
+	for i, c := range gputest.ShadowCases() {
+		s := gputest.ShadowPanelScene(c)
+		var split, whole Builder
+		whole.NoShadowSplit = true
+		split.Build(s, nil)
+		whole.Build(s, nil)
+		wa, wn := shadowFragments(&whole)
+		sa, sn := shadowFragments(&split)
+		if wn != len(c.Blur) {
+			t.Fatalf("case %d: %d shadow instances without the split, want %d", i, wn, len(c.Blur))
+		}
+		if sn <= wn || sa >= wa {
+			t.Errorf("case %d: split shades %d px in %d instances, whole %d px in %d", i, sa, sn, wa, wn)
+		}
+		// The pieces of one shadow are disjoint and stay out of the core.
+		core := shadowCore(scene.Rect{X: 70, Y: 60, W: 340, H: 220}, [4]float32{c.Radius, c.Radius, c.Radius, c.Radius}, c.Continuous)
+		var pieces []Scissor
+		for _, bt := range split.Batches {
+			for _, in := range split.Instances[bt.Start : bt.Start+bt.Count] {
+				if in.Params[0] == 1 {
+					pieces = append(pieces, bt.Scissor)
+				}
+			}
+		}
+		for x, p := range pieces {
+			if p != (Scissor{0, 0, int32(s.Width), int32(s.Height)}) && p.intersect(core).area() != 0 { // whole: not split
+				t.Errorf("case %d: piece %d %v reaches the core %v", i, x, p, core)
+			}
+		}
+	}
+	// Small shadows, and shadows without a caster, are one instance.
+	small := &scene.Scene{Width: 200, Height: 100, Ops: []scene.Op{
+		{Kind: scene.OpShadow, Rect: scene.Rect{X: 20, Y: 20, W: 40, H: 30}, Color: scene.Color{A: 80}, Blur: 8,
+			Cast: scene.Rect{X: 20, Y: 20, W: 40, H: 30}},
+		{Kind: scene.OpShadow, Rect: scene.Rect{X: 20, Y: 20, W: 150, H: 80}, Color: scene.Color{A: 80}, Blur: 8},
+	}}
+	var b Builder
+	b.Build(small, nil)
+	if len(b.Instances) != 2 || len(b.Batches) != 1 {
+		t.Errorf("small shadows: %d instances in %d batches", len(b.Instances), len(b.Batches))
+	}
+}
+
+// TestCullLeavesOutCoveredOps checks how many ops the builder leaves out of
+// scenes where opaque fills cover others, and that it leaves none out when
+// told not to.
+func TestCullLeavesOutCoveredOps(t *testing.T) {
+	for _, c := range gputest.CullCases() {
+		var culled, whole Builder
+		whole.NoCull = true
+		tex := func(*scene.Image) uintptr { return 1 }
+		culled.Build(c.Scene, tex)
+		whole.Build(c.Scene, tex)
+		if whole.Culled != 0 {
+			t.Errorf("%s: %d ops left out with NoCull", c.Name, whole.Culled)
+		}
+		if culled.Culled != c.Culled {
+			t.Errorf("%s: %d ops left out, want %d", c.Name, culled.Culled, c.Culled)
+		}
+		if c.Culled == 0 && len(culled.Instances) != len(whole.Instances) {
+			t.Errorf("%s: %d instances, want %d", c.Name, len(culled.Instances), len(whole.Instances))
+		}
+		if c.Culled > 0 && len(culled.Instances) >= len(whole.Instances) {
+			t.Errorf("%s: %d instances, not fewer than %d", c.Name, len(culled.Instances), len(whole.Instances))
+		}
+	}
+}
+
+// TestCullPlanIsBounded checks that a scene of many fills, none of them
+// hidden by a bounded number of occluders, is planned in a linear number of
+// steps (here: it only has to finish quickly and leave out what is hidden).
+func TestCullPlanIsBounded(t *testing.T) {
+	s := &scene.Scene{Width: 4000, Height: 4000}
+	for i := range 20000 {
+		x := float32(i%100) * 40
+		y := float32(i/100) * 20
+		s.Ops = append(s.Ops, scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: x, Y: y, W: 30, H: 15}, Color: scene.Color{R: 1, A: 255}})
+	}
+	// One panel over the first cells.
+	s.Ops = append(s.Ops, scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 0, Y: 0, W: 400, H: 200}, Color: scene.Color{A: 255}})
+	var b Builder
+	b.Build(s, nil)
+	if b.Culled != 100 { // 10 columns by 10 rows of cells lie inside the panel's core
+		t.Errorf("%d ops left out, want 100", b.Culled)
+	}
+}
+
+// TestCullKeepsTransformedShadows checks that the planner does not leave out a
+// shadow under a transform whose blur reaches out of the cover over it: the blur
+// grows with the scale, so a shadow of blur 20 at scale 4 reaches about 120
+// device pixels from its box, and a cover of the box and 100 pixels around it
+// does not hold it. A cover of the frame does.
+func TestCullKeepsTransformedShadows(t *testing.T) {
+	shadow := scene.Op{Kind: scene.OpShadow, Rect: scene.Rect{X: 50, Y: 50, W: 40, H: 40}, Color: scene.Color{A: 255}, Blur: 20, Transform: scene.Scaling(4, 4)}
+	cover := func(r scene.Rect) scene.Op {
+		return scene.Op{Kind: scene.OpFill, Rect: r, Color: scene.Color{R: 1, A: 255}}
+	}
+	for _, c := range []struct {
+		name   string
+		cover  scene.Rect
+		culled int
+	}{
+		{"cover of the box and 100 px", scene.Rect{X: 154, Y: 154, W: 252, H: 252}, 0},
+		{"cover of the frame", scene.Rect{W: 640, H: 640}, 1},
+	} {
+		var b Builder
+		b.Build(&scene.Scene{Width: 640, Height: 640, Ops: []scene.Op{shadow, cover(c.cover)}}, nil)
+		if b.Culled != c.culled {
+			t.Errorf("%s: %d ops left out, want %d", c.name, b.Culled, c.culled)
+		}
 	}
 }

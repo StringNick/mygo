@@ -131,8 +131,19 @@ type Builder struct {
 	// Wide draws the colors of scenes outside the sRGB gamut
 	// (Scene.Wide), for a target that keeps them, as Metal's float16
 	// drawables do; without it, their nearest sRGB colors.
-	Wide  bool
-	stack []clip
+	Wide bool
+	// NoShadowSplit draws every shadow as one instance, for comparison tests.
+	NoShadowSplit bool
+	// NoCull draws covered ops too, for comparison tests.
+	NoCull bool
+	// Culled is how many ops the last Build left out as covered.
+	Culled       int
+	culled       []bool
+	plan         []cullInfo
+	planStack    []clip
+	split        bool
+	splitScissor Scissor
+	stack        []clip
 	// encloses tells, for each op of the scene, that it pushes a clip with
 	// a transformed op or glyph inside it.
 	encloses     []bool
@@ -198,6 +209,23 @@ type clip struct {
 	maskTexture uintptr
 }
 
+// pushed returns the clip that op (an OpPushClip) makes within top, without
+// a mask slot or texture.
+func (b *Builder) pushed(top *clip, op *scene.Op, encloses bool) clip {
+	bounds := top.bounds.Intersect(op.Transform.Bounds(op.Rect))
+	// The innermost clip shapes its edges in the shader, the others cut
+	// with the scissor rectangle.
+	c := clip{rect: op.Rect, radii: scene.Corners(op.Rect, op.Radii, op.Continuous), bounds: bounds,
+		shape: scene.ClipShape{Rect: op.Rect, Radii: op.Radii, Transform: op.Transform, Continuous: op.Continuous}, maskSlot: -1}
+	c.moved = top.moved || op.Transform.Set
+	c.masked = c.moved || encloses && (top.masked || c.radii != [4]float32{})
+	if bounds.W > 0 && bounds.H > 0 {
+		c.scissor = Scissor{int32(math.Floor(float64(bounds.X))), int32(math.Floor(float64(bounds.Y))),
+			int32(math.Ceil(float64(bounds.X + bounds.W))), int32(math.Ceil(float64(bounds.Y + bounds.H)))}
+	}
+	return c
+}
+
 // Build turns a scene directly into GPU instances, retaining local geometry
 // and composing transforms in the vertex shader. Nested affine clips use
 // cached masks; stationary clipping never rasterizes again as content moves.
@@ -216,27 +244,20 @@ func (b *Builder) Build(s *scene.Scene, image func(*scene.Image) uintptr) *scene
 	everything := scene.Rect{X: -1e6, Y: -1e6, W: 2e6, H: 2e6}
 	b.stack = append(b.stack[:0], clip{rect: everything, bounds: scene.Rect{W: float32(s.Width), H: float32(s.Height)},
 		scissor: Scissor{0, 0, int32(s.Width), int32(s.Height)}})
+	b.planCull(s)
 	for i := range s.Ops {
 		op := &s.Ops[i]
+		if b.culled[i] {
+			continue
+		}
 		switch op.Kind {
 		case scene.OpPushClip:
-			top := b.stack[len(b.stack)-1]
-			bounds := top.bounds.Intersect(op.Transform.Bounds(op.Rect))
-			// The innermost clip shapes its edges in the shader, the
-			// others cut with the scissor rectangle.
-			c := clip{rect: op.Rect, radii: scene.Corners(op.Rect, op.Radii, op.Continuous), bounds: bounds,
-				shape: scene.ClipShape{Rect: op.Rect, Radii: op.Radii, Transform: op.Transform, Continuous: op.Continuous}, maskSlot: -1}
-			c.moved = top.moved || op.Transform.Set
-			c.masked = c.moved || b.encloses[i] && (top.masked || c.radii != [4]float32{})
+			c := b.pushed(&b.stack[len(b.stack)-1], op, b.encloses[i])
 			if c.masked {
 				c.maskSlot = b.maskUsed
 				b.maskUsed++
 			}
 			b.clipShapes = append(b.clipShapes, c.shape)
-			if bounds.W > 0 && bounds.H > 0 {
-				c.scissor = Scissor{int32(math.Floor(float64(bounds.X))), int32(math.Floor(float64(bounds.Y))),
-					int32(math.Ceil(float64(bounds.X + bounds.W))), int32(math.Ceil(float64(bounds.Y + bounds.H)))}
-			}
 			b.stack = append(b.stack, c)
 		case scene.OpPopClip:
 			if len(b.stack) > 1 {
@@ -302,7 +323,7 @@ func (b *Builder) Build(s *scene.Scene, image func(*scene.Image) uintptr) *scene
 			if !op.Cast.Empty() {
 				in.UV, in.Inner = rect(op.Cast), scene.Corners(op.Cast, op.CastRadii, op.Continuous)
 			}
-			b.add(in, 0, op.Transform)
+			b.addShadow(in, op, sigma)
 		case scene.OpGlyphs:
 			grad := op.Paint == scene.PaintLinear || op.Paint == scene.PaintOklab
 			var c1, c2 [4]float32
@@ -428,16 +449,129 @@ func (b *Builder) add(in Instance, image uintptr, m scene.Affine) {
 		return
 	}
 	n := len(b.Batches)
-	if n == 0 || b.Batches[n-1].Scissor != cur.scissor || b.Batches[n-1].Effect != nil || b.Batches[n-1].Hole ||
+	sc := b.batchScissor(cur)
+	if n == 0 || b.Batches[n-1].Scissor != sc || b.Batches[n-1].Effect != nil || b.Batches[n-1].Hole ||
 		b.Batches[n-1].ClipMask != b.preparedMask ||
 		(image != 0 && b.Batches[n-1].Image != 0 && b.Batches[n-1].Image != image) {
-		b.Batches = append(b.Batches, Batch{Start: len(b.Instances), Scissor: cur.scissor, Image: image, ClipMask: b.preparedMask})
+		b.Batches = append(b.Batches, Batch{Start: len(b.Instances), Scissor: sc, Image: image, ClipMask: b.preparedMask})
 		n++
 	} else if image != 0 {
 		b.Batches[n-1].Image = image
 	}
 	b.Instances = append(b.Instances, in)
 	b.Batches[n-1].Count++
+}
+
+// shadowSplitMin is the area, in pixels, below which a shadow is not split
+// around its caster: a draw call costs more than shading so few fragments.
+const shadowSplitMin = 4096
+
+// shadowCore returns the pixels that the box casting a shadow certainly
+// covers whole: its rectangle less the corner curves and the antialiased
+// edge. A shadow shows only outside its caster, so the shaders write nothing
+// there (the coverage of the caster is 1, and the shadow is multiplied by
+// what it leaves).
+func shadowCore(cast scene.Rect, radii [4]float32, continuous bool) Scissor {
+	corner := float32(0)
+	for _, r := range radii {
+		corner = max(corner, r, -r)
+	}
+	if continuous {
+		corner *= 1.7 // where the curves end, see ContCorner
+	}
+	m := corner + 2
+	return Scissor{
+		Left:   int32(math.Ceil(float64(cast.X + m))),
+		Top:    int32(math.Ceil(float64(cast.Y + m))),
+		Right:  int32(math.Floor(float64(cast.X + cast.W - m))),
+		Bottom: int32(math.Floor(float64(cast.Y + cast.H - m))),
+	}
+}
+
+func (s Scissor) intersect(o Scissor) Scissor {
+	return Scissor{max(s.Left, o.Left), max(s.Top, o.Top), min(s.Right, o.Right), min(s.Bottom, o.Bottom)}
+}
+
+func (s Scissor) area() int64 {
+	if s.Empty() {
+		return 0
+	}
+	return int64(s.Right-s.Left) * int64(s.Bottom-s.Top)
+}
+
+// addShadow appends the instance of a shadow. A large shadow of a box
+// (Cast) is drawn as up to four instances around the core of that box,
+// each with a scissor rectangle of its own, so that the renderers shade no
+// fragment of the core, where the shadow is multiplied by zero and the
+// pixels are the same either way. A shadow of a box that fills the window
+// would otherwise shade, with its blur, all of it, once for each layer of
+// an elevation.
+func (b *Builder) addShadow(in Instance, op *scene.Op, sigma float32) {
+	cur := &b.stack[len(b.stack)-1]
+	if b.NoShadowSplit || op.Cast.Empty() || op.Transform.Set || cur.scissor.Empty() {
+		b.add(in, 0, op.Transform)
+		return
+	}
+	core := shadowCore(op.Cast, scene.Corners(op.Cast, op.CastRadii, op.Continuous), op.Continuous)
+	reach := 3 * sigma // what the vertex shader grows the quad by; shadowSupport bounds it
+	quad := Scissor{
+		Left: int32(math.Floor(float64(op.Rect.X - reach))), Top: int32(math.Floor(float64(op.Rect.Y - reach))),
+		Right: int32(math.Ceil(float64(op.Rect.X + op.Rect.W + reach))), Bottom: int32(math.Ceil(float64(op.Rect.Y + op.Rect.H + reach))),
+	}.intersect(cur.scissor)
+	if !worthSplitting(core, quad) {
+		b.add(in, 0, op.Transform)
+		return
+	}
+	b.addAround(in, op.Transform, core)
+}
+
+// addAround appends in as up to four instances around core, each with a
+// scissor rectangle of its own: they tile the current clip's scissor
+// rectangle less core, whatever the renderer's quad is (core must lie inside
+// the quad). The pixels are the same as drawing it whole, for an instance
+// that leaves the destination as it is within core.
+func (b *Builder) addAround(in Instance, m scene.Affine, core Scissor) {
+	cur := &b.stack[len(b.stack)-1]
+	whole := cur.scissor
+	hole := core.intersect(whole)
+	strips := [4]Scissor{
+		{whole.Left, whole.Top, whole.Right, hole.Top},
+		{whole.Left, hole.Bottom, whole.Right, whole.Bottom},
+		{whole.Left, hole.Top, hole.Left, hole.Bottom},
+		{hole.Right, hole.Top, whole.Right, hole.Bottom},
+	}
+	defer b.scissorBatches(Scissor{}, false)
+	for _, st := range strips {
+		if st.Empty() {
+			continue
+		}
+		b.scissorBatches(st, true)
+		b.add(in, 0, m)
+	}
+}
+
+// scissorBatches makes the batches that add makes from now on scissored to sc,
+// within the clip's scissor rectangle, or, when on is false, to the clip's.
+// The clip's own scissor rectangle stays as it is: for a masked clip it is also
+// the area of the clip's mask and the mapping the shader samples it by.
+func (b *Builder) scissorBatches(sc Scissor, on bool) { b.split, b.splitScissor = on, sc }
+
+// batchScissor returns the scissor rectangle of the batch that add starts or
+// extends within the clip cur.
+func (b *Builder) batchScissor(cur *clip) Scissor {
+	if b.split {
+		return b.splitScissor
+	}
+	return cur.scissor
+}
+
+// worthSplitting reports whether drawing around core, a draw call for each
+// side, beats shading it: core within the quad is large, and a fair part of
+// the quad.
+func worthSplitting(core, quad Scissor) bool {
+	hole := core.intersect(quad)
+	a := hole.area()
+	return a >= shadowSplitMin && 4*a >= quad.area()
 }
 
 // addEffect appends the instance of an effect within the current clip, in

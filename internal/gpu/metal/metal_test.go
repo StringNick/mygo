@@ -3,8 +3,11 @@
 package metal
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"math"
+	"os"
 	"testing"
 	"unsafe"
 
@@ -13,10 +16,22 @@ import (
 	"github.com/egoist/mygo/internal/scene"
 )
 
+// unavailable ends a test for which Metal cannot be used: it skips it, or, where
+// MYGO_GPU_REQUIRED is set (a machine with a GPU, CI for it), fails it, so that
+// a renderer that does not start does not turn the identity tests into passing
+// skips.
+func unavailable(t testing.TB, err error) {
+	t.Helper()
+	if os.Getenv("MYGO_GPU_REQUIRED") != "" {
+		t.Fatal("no Metal (MYGO_GPU_REQUIRED is set):", err)
+	}
+	t.Skip("no Metal:", err)
+}
+
 func TestDrawsAsTheCPURenderer(t *testing.T) {
 	r, err := newRenderer()
 	if err != nil {
-		t.Skip("no Metal:", err)
+		unavailable(t, err)
 	}
 	defer r.Release()
 	s := gputest.Scene()
@@ -61,7 +76,7 @@ func TestDrawsAsTheCPURenderer(t *testing.T) {
 func TestDrawingResourcesOnDemand(t *testing.T) {
 	r, err := newRenderer()
 	if err != nil {
-		t.Skip("no Metal:", err)
+		unavailable(t, err)
 	}
 	defer r.Release()
 	if r.queue != 0 || r.sampler != 0 || r.empty != 0 || r.cur.pipeline != 0 {
@@ -86,7 +101,7 @@ func TestShaderLibrary(t *testing.T) {
 	}
 	r, err := newRenderer()
 	if err != nil {
-		t.Skip("no Metal:", err)
+		unavailable(t, err)
 	}
 	defer r.Release()
 	var lib id
@@ -105,7 +120,7 @@ func TestShaderLibrary(t *testing.T) {
 func TestWideColors(t *testing.T) {
 	r, err := newRenderer()
 	if err != nil {
-		t.Skip("no Metal:", err)
+		unavailable(t, err)
 	}
 	defer r.Release()
 	if !r.SetWide(true) {
@@ -195,4 +210,249 @@ func half(h uint16) float32 {
 		return sign * float32(math.Inf(1))
 	}
 	return sign * (1 + m/1024) * float32(math.Pow(2, float64(e-15)))
+}
+
+// TestShadowSplitDrawsTheSamePixels draws panels with stacks of shadows of
+// several radii, blurs, spreads and offsets, with the shadows drawn around the
+// box casting them and whole, and requires the same bytes.
+func TestShadowSplitDrawsTheSamePixels(t *testing.T) {
+	r, err := newRenderer()
+	if err != nil {
+		unavailable(t, err)
+	}
+	defer r.Release()
+	for i, c := range gputest.ShadowCases() {
+		s := gputest.ShadowPanelScene(c)
+		r.b.NoShadowSplit = false
+		split, err := r.renderOffscreen(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		instances := len(r.b.Instances)
+		r.b.NoShadowSplit = true
+		whole, err := r.renderOffscreen(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if instances <= len(r.b.Instances) {
+			t.Errorf("case %d: the split drew %d instances, whole %d", i, instances, len(r.b.Instances))
+		}
+		if !bytes.Equal(split, whole) {
+			n := 0
+			for k := range split {
+				if split[k] != whole[k] {
+					n++
+				}
+			}
+			t.Errorf("case %d: %d bytes differ between split and whole shadows", i, n)
+		}
+		gputest.Compare(t, "metal-shadow-split", split, s.Width*4, s)
+	}
+}
+
+// renderRaw draws s into a target of the renderer's format, BGRA8 or, when
+// wide, float16, and returns its bytes as the GPU keeps them.
+func renderRaw(t *testing.T, r *Renderer, s *scene.Scene, wide bool) (raw []byte) {
+	t.Helper()
+	var err error
+	pool(func() {
+		r.waitLast()
+		r.cur = &r.formats[0]
+		format, bpp := uint(pixelFormatBGRA8Unorm), 4
+		if wide {
+			r.cur, format, bpp = &r.formats[1], pixelFormatRGBA16Float, 8
+		}
+		tex := r.newTexture(s.Width, s.Height, format, usageRenderTarget|usageShaderRead, nil, 0)
+		if tex == 0 {
+			err = errors.New("no target")
+			return
+		}
+		defer release(&tex)
+		var cb id
+		if cb, err = r.encode(s, tex); err != nil {
+			return
+		}
+		blit := send(cb, "blitCommandEncoder")
+		send(blit, "synchronizeResource:", tex)
+		send(blit, "endEncoding")
+		send(cb, "commit")
+		send(cb, "waitUntilCompleted")
+		if int(send(cb, "status")) == statusError {
+			err = fmt.Errorf("the frame failed: %s", describe(send(cb, "error")))
+			return
+		}
+		raw = make([]byte, s.Width*s.Height*bpp)
+		msgGetBytes(tex, sel("getBytes:bytesPerRow:fromRegion:mipmapLevel:"), unsafe.Pointer(&raw[0]), uint(s.Width*bpp),
+			mtlRegion{W: uint(s.Width), H: uint(s.Height), D: 1}, 0)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func differing(a, b []byte) (n int) {
+	for i := range a {
+		if a[i] != b[i] {
+			n++
+		}
+	}
+	return n
+}
+
+// TestCullDrawsTheSamePixels draws scenes of overlapping fills with the ops
+// that later opaque fills cover left out and with all of them, in BGRA8 and
+// float16 targets, and requires the same bytes, and the CPU renderer's pixels.
+func TestCullDrawsTheSamePixels(t *testing.T) {
+	r, err := newRenderer()
+	if err != nil {
+		unavailable(t, err)
+	}
+	defer r.Release()
+	cases := append(gputest.CullCases(), gputest.CullCase{Name: "reference scene", Scene: gputest.Scene(), Culled: -1})
+	for _, wide := range []bool{false, true} {
+		if wide && !r.SetWide(true) {
+			t.Log("no wide target:", r.wideErr)
+			continue
+		}
+		for _, c := range cases {
+			r.b.NoCull = false
+			culled := renderRaw(t, r, c.Scene, wide)
+			n, instances := r.b.Culled, len(r.b.Instances)
+			r.b.NoCull = true
+			whole := renderRaw(t, r, c.Scene, wide)
+			if c.Culled >= 0 && n != c.Culled {
+				t.Errorf("%s wide=%v: %d ops left out, want %d", c.Name, wide, n, c.Culled)
+			}
+			if n > 0 && instances >= len(r.b.Instances) {
+				t.Errorf("%s wide=%v: %d instances with the cull, %d without", c.Name, wide, instances, len(r.b.Instances))
+			}
+			if d := differing(culled, whole); d != 0 {
+				t.Errorf("%s wide=%v: %d bytes differ between culled and whole", c.Name, wide, d)
+			}
+			if !wide {
+				gputest.Compare(t, "metal-cull-"+c.Name, culled, c.Scene.Width*4, c.Scene)
+			}
+		}
+	}
+	r.b.NoCull = false
+}
+
+// identityCases are the scenes of the identity tests of changes to how
+// scenes are drawn: the cases of the cull and shadow tests, the
+// scenes of fills and opaque fills at window sizes, the reference scene and
+// the scenes of transformed content.
+func identityCases() []gputest.CullCase {
+	cases := []gputest.CullCase{{Name: "reference scene", Scene: gputest.Scene()}, {Name: "transformed scene", Scene: gputest.TransformedScene()},
+		{Name: "perspective scene", Scene: gputest.PerspectiveScene()}, {Name: "axis clip scene", Scene: gputest.AxisClipScene()},
+		{Name: "continuous scene", Scene: gputest.ContinuousScene()}}
+	cases = append(cases, gputest.CullCases()...)
+	for i, c := range gputest.ShadowCases() {
+		cases = append(cases, gputest.CullCase{Name: fmt.Sprint("shadow case ", i), Scene: gputest.ShadowPanelScene(c)})
+	}
+	cases = append(cases, gputest.CullCase{Name: "wide colors", Scene: gputest.WideScene()})
+	for _, c := range gputest.MaskedCases() {
+		cases = append(cases, gputest.CullCase{Name: c.Name, Scene: c.Scene})
+	}
+	// Every case again with a transformed op in front, which gives rounded
+	// clips masks (the splits must not touch the clip's mask area).
+	n := len(cases)
+	for _, c := range cases[:n] {
+		cases = append(cases, gputest.CullCase{Name: c.Name + " (transformed scene)", Scene: gputest.Transformed(c.Scene)})
+	}
+	return cases
+}
+
+// TestSplitsDrawTheSamePixels draws every identity case with the shadow and
+// splits and without them, in BGRA8 and float16, and requires the same
+// bytes. The cases include rounded, continuous and rotated clips with masks,
+// where the pieces must not change the clip's mask area.
+func TestSplitsDrawTheSamePixels(t *testing.T) {
+	r, err := newRenderer()
+	if err != nil {
+		unavailable(t, err)
+	}
+	defer r.Release()
+	pieces := 0
+	for _, wide := range []bool{false, true} {
+		if wide && !r.SetWide(true) {
+			t.Log("no wide target:", r.wideErr)
+			continue
+		}
+		for _, c := range identityCases() {
+			r.b.NoShadowSplit = false
+			split := renderRaw(t, r, c.Scene, wide)
+			n := len(r.b.Instances)
+			r.b.NoShadowSplit = true
+			whole := renderRaw(t, r, c.Scene, wide)
+			pieces += n - len(r.b.Instances)
+			if d := differing(split, whole); d != 0 {
+				t.Errorf("%s wide=%v: %d bytes differ between split and whole", c.Name, wide, d)
+			}
+		}
+	}
+	if pieces == 0 {
+		t.Error("nothing was split")
+	}
+	r.b.NoShadowSplit = false
+}
+
+// TestCullTransformedShadows draws a shadow under a transform, scaled, rotated,
+// scaled unevenly and in perspective, with an opaque fill over exactly what the
+// planner took to be the shadow's reach before the blur was grown in the shadow's
+// own units (the blur's reach, in device pixels, grows with the scale), and
+// requires that culling changes no pixel; and that a cover of the whole frame
+// still culls it.
+func TestCullTransformedShadows(t *testing.T) {
+	r, err := newRenderer()
+	if err != nil {
+		unavailable(t, err)
+	}
+	defer r.Release()
+	cases := []struct {
+		name string
+		m    scene.Affine
+		rect scene.Rect
+		blur float32
+		cast bool
+	}{
+		{"scale4", scene.Scaling(4, 4), scene.Rect{X: 50, Y: 50, W: 40, H: 40}, 20, false},
+		{"scale4cast", scene.Scaling(4, 4), scene.Rect{X: 50, Y: 50, W: 40, H: 40}, 20, true},
+		{"nonuniform", scene.Scaling(4, 1.5), scene.Rect{X: 50, Y: 150, W: 40, H: 40}, 20, false},
+		{"rotate30x3", scene.Translation(320, 320).Mul(scene.Rotation(30)).Mul(scene.Scaling(3, 3)).Mul(scene.Translation(-20, -20)), scene.Rect{W: 40, H: 40}, 16, false},
+		{"scale1.5", scene.Scaling(1.5, 1.5), scene.Rect{X: 150, Y: 150, W: 60, H: 60}, 60, false},
+		{"perspective", scene.Projective(2, 0, 0, 2, 100, 100, 0.0008, 0), scene.Rect{X: 50, Y: 50, W: 60, H: 60}, 20, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b := c.m.Bounds(c.rect)
+			g := 2*c.blur + 3 + 1 + 2 // the growth the planner had, plus the occluder's inset
+			x0, y0 := float32(math.Floor(float64(b.X-g))), float32(math.Floor(float64(b.Y-g)))
+			x1, y1 := float32(math.Ceil(float64(b.X+b.W+g))), float32(math.Ceil(float64(b.Y+b.H+g)))
+			sh := scene.Op{Kind: scene.OpShadow, Rect: c.rect, Color: scene.Color{A: 255}, Blur: c.blur, Transform: c.m}
+			if c.cast {
+				sh.Cast = scene.Rect{X: c.rect.X + 4, Y: c.rect.Y + 4, W: c.rect.W - 8, H: c.rect.H - 8}
+			}
+			s := &scene.Scene{Width: 640, Height: 640, Clear: scene.Color{R: 255, G: 255, B: 255, A: 255}}
+			s.Ops = []scene.Op{sh, {Kind: scene.OpFill, Rect: scene.Rect{X: x0, Y: y0, W: x1 - x0, H: y1 - y0}, Color: scene.Color{R: 180, G: 180, B: 180, A: 255}}}
+			r.b.NoCull = false
+			got := renderRaw(t, r, s, false)
+			culled := r.b.Culled
+			r.b.NoCull = true
+			want := renderRaw(t, r, s, false)
+			r.b.NoCull = false
+			if d := differing(got, want); d != 0 {
+				t.Errorf("culled %d op(s), %d bytes differ", culled, d)
+			}
+		})
+	}
+	s := &scene.Scene{Width: 640, Height: 640}
+	s.Ops = []scene.Op{
+		{Kind: scene.OpShadow, Rect: scene.Rect{X: 50, Y: 50, W: 40, H: 40}, Color: scene.Color{A: 255}, Blur: 20, Transform: scene.Scaling(4, 4)},
+		{Kind: scene.OpFill, Rect: scene.Rect{X: 0, Y: 0, W: 640, H: 640}, Color: scene.Color{R: 180, G: 180, B: 180, A: 255}},
+	}
+	renderRaw(t, r, s, false)
+	if r.b.Culled != 1 {
+		t.Errorf("a full-frame cover culled %d ops, want 1", r.b.Culled)
+	}
 }
