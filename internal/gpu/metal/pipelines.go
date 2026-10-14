@@ -147,8 +147,11 @@ func (r *Renderer) pipelineWorker() {
 	defer r.pipes.wg.Done()
 	for k := range r.pipes.work {
 		r.pipes.mu.Lock()
-		d := r.pipes.delay
+		d, closed := r.pipes.delay, r.pipes.closed
 		r.pipes.mu.Unlock()
+		if closed {
+			return // Release waits for the active compile, not the warmup backlog.
+		}
 		if d > 0 {
 			time.Sleep(d)
 		}

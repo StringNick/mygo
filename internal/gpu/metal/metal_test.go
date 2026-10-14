@@ -905,3 +905,31 @@ func TestCullKeepsHardShadowsWithNegativeBlur(t *testing.T) {
 		}
 	}
 }
+
+// Closing a window waits for an active compile to release its library safely,
+// but does not compile the rest of that window's speculative warmup queue.
+func TestReleaseStopsQueuedPipelineCompiles(t *testing.T) {
+	syncPipelines = false
+	defer func() { syncPipelines = true }()
+	r, err := newRenderer()
+	if err != nil {
+		unavailable(t, err)
+	}
+	defer r.Release()
+	r.pipes.delay = 250 * time.Millisecond
+	renderRaw(t, r, gputest.Scene(), false)
+	r.pipes.mu.Lock()
+	pending, before := len(r.pipes.work), r.pipes.nbuilt
+	r.pipes.mu.Unlock()
+	if pending < 2 {
+		t.Fatalf("need queued warmup work, got %d", pending)
+	}
+	r.Release()
+	after, failed := r.pipelineCounts()
+	if after-before > 1 {
+		t.Fatalf("Release built %d queued pipelines; only an active compile may finish", after-before)
+	}
+	if failed != 0 {
+		t.Fatalf("%d pipeline builds failed", failed)
+	}
+}
