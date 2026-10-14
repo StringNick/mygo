@@ -91,6 +91,7 @@ framework safely. Read it before changing anything under `internal/`.
 │   ├── svg/            SVG parsing and drawing, for icons and images
 │   ├── tsgen/          TypeScript client generator
 │   ├── i18ngen/        checks catalogs of messages, writes their Go and TypeScript functions
+│   ├── i18nlink/       what package i18n gives MyGo's own catalog only: a catalog that links no dates
 │   ├── l10n/           MyGo's own strings: the catalog of the controls and menu roles
 │   ├── accelerator/    parses "CmdOrCtrl+Shift+K"
 │   ├── update/         update manifests, signatures, archives and delta updates
@@ -787,6 +788,14 @@ window (`CallerWindow`) and is canceled when the page navigates or the window
 closes. `Bind` validates every parameter and result type up front
 (`tsgen.Validate`), so unsupported types fail at startup, not at call time.
 
+`Bind` lists a service's methods with `reflect.Type.Method`, and a program
+that does that keeps every exported method of every type in an interface,
+since the linker cannot tell which it calls: about 2.5 MB of a native UI
+app. So only apps that call `Bind` (or `Use` a plugin with a service) link
+it. MyGo's own service, `mygo:window` behind `window.mygo.window`, is bound
+by `bindFuncs`, from funcs, without it; `go build -ldflags=-dumpdep`
+prints `<ReflectMethod>` on what does it.
+
 JSON options (`jsonOptions` in `ipc.go`) are shared by calls and events:
 json/v2 defaults (nil slices encode as `[]`, case-sensitive names),
 `time.Duration` as nanoseconds, and U+2028/2029 escaped for JavaScript.
@@ -1011,7 +1020,11 @@ build` like mygo-runtime and released with the same version.
     goroutine under the terminal's lock, where waiting for the main
     thread could deadlock. The binding gathers the library's reply and
     hands it over in one piece, which the input queue writes in pieces
-    that report their progress.
+    that report their progress. Any other read of the clipboard
+    (`ClipboardRead`: OSC 52's "?" and OSC 5522, unless a paste granted
+    it) is queued instead: the binding holds the library's own refusal
+    back, and the view, on the main thread, reads the clipboard and
+    writes the answer, which the reader's lock makes safe.
   - *Shipping the library.* `mygo-plugin.json` names its build for each
     platform, published as release assets with their SHA-256 checksums.
     The CLI puts them into apps
@@ -1094,7 +1107,10 @@ build` like mygo-runtime and released with the same version.
 
 `mygo generate` builds the app and runs it with `MYGO_GENERATE=<file>`;
 `App.Run` then writes the client (`WriteTypeScript`) and returns before
-touching the GUI. The generator combines:
+touching the GUI. It reaches the generator through what `Bind`, `BindAs`
+and `NewEvent` register (`ipc.writeClient`): an app that binds nothing
+writes no client, and links neither the generator nor go/parser (375 KB).
+The generator combines:
 
 - **Reflection** for correctness: types follow json/v2 encoding (embedded
   structs are inlined with v2's conflict rules, `omitempty`/`omitzero` become
@@ -1176,10 +1192,15 @@ Package `i18n` is a leaf (it imports golang.org/x/text/language only):
   patterns and digits of the default numbering system and of latn); each
   locale stores only the slots in which it differs from its nearest
   ancestor of the list (or from a synthetic root of the values most
-  locales have), as indexes into one pool of strings; the big tables are
-  packed with DEFLATE. At run time `cldr.go` inflates them once and puts a
+  locales have), as indexes into a pool of strings. The slots come in
+  two halves, each with its own entries and pool, packed with DEFLATE in
+  a constant of its own: the numbers with the locales and their parents
+  (`fmtPackedNumbers`, 3 KB), which every app links, as MyGo's own strings
+  format numbers, and the dates with the names of languages
+  (`fmtPackedDates`, 77 KB), which only apps that format dates or name
+  languages link. At run time `cldr.go` inflates each once and puts a
   locale's record together on its first use (an atomic pointer per
-  locale); `keyOf` caches what a tag formats with (its data locale, by
+  locale), its dates on the first date it formats (`withDates`); `keyOf` caches what a tag formats with (its data locale, by
   `Parent` and likely scripts, and its `-u-hc`, `-u-fw`, `-u-nu`). Week
   data, time data and day period rules are small tables by region.
   `dtpg.go` ports ICU's DateTimePatternGenerator (dtTypes, distances,
@@ -1195,7 +1216,11 @@ Package `i18n` is a leaf (it imports golang.org/x/text/language only):
   ICU's MessagePattern does (apostrophe mode DOUBLE_OPTIONAL, `#` only in
   a plural's own cases), and formats numbers and dates with the
   formatting above; a plural case is picked on the number as `#` writes
-  it. `mygo-runtime/i18n` is its TypeScript twin over `Intl` (skeletons
+  it. Dates go through `timeFormat`, which `NewCatalog`,
+  `NewLibraryCatalog` and `ParseMessage` set (`linkTimes`): MyGo's own
+  catalog, which every app formats and which has no dates (its test
+  checks), is made through `internal/i18nlink`, which does not, so an app
+  that formats no date links no date formatting. `mygo-runtime/i18n` is its TypeScript twin over `Intl` (skeletons
   turned into `Intl`'s options, as V8 turns them back);
   `i18n/testdata/messages.json` holds the cases both test.
 - **Catalogs** read a language's file once, on its first message
@@ -1227,9 +1252,11 @@ does not import `internal/l10n`.
 registered for apps, and a function and a method of `Messages` per key)
 and the TypeScript module, which carries the messages with each
 language's fallback chain. `internal/l10n` is MyGo's own catalog,
-generated by the same code (`go generate ./internal/l10n`), whose keys
-apps change as `mygo.<key>`; the CLI checks those keys against it. It
-embeds English only: each translation is a package,
+generated by the same code (`go generate ./internal/l10n`, with
+`i18ngen.Options.Own`), whose keys apps change as `mygo.<key>`; the CLI
+checks those keys against it (`l10n.FS`, the files as written, which only
+the CLI links). It embeds English only, as `messages/en.json`, which the
+generator writes from `en.json` without the descriptions (7 KB of 28): each translation is a package,
 `locales/<tag>`, that adds its file to the catalog as it is imported
 (`i18n.Catalog.Add`), so that an app links only the languages it ships.
 The generator writes those packages and `l10n.Languages`; the CLI passes
@@ -1609,8 +1636,9 @@ it sees and what it saw (`fileWatchDiff`). An entry whose identity
 (`os.SameFile`) moved is a rename, unless a hard link makes it ambiguous,
 and what moved with a directory renamed above it says nothing more. When
 the system lost changes (an inotify queue overflow, Windows'
-`ERROR_NOTIFY_ENUM_DIR`), the core lists every directory again rather than
-stopping. Enrolling is checked against the scan: the backend opens a target
+`ERROR_NOTIFY_ENUM_DIR`, FSEvents' `MustScanSubDirs` or a dropped event),
+the core lists every directory again rather than stopping. Enrolling is
+checked against the scan: the backend opens a target
 and compares its identity with what the scan saw, then the scan stats it
 again, so that an entry replaced in between (an editor's atomic save) is
 looked at again rather than watched in place of the other.
@@ -1643,9 +1671,24 @@ reports; `notice` hands it to the watch's goroutine over a channel, and a
 full channel makes the watch look at everything again. Neither uses the
 main thread, so watches work before the app runs and don't wait on it.
 
-- macOS: kqueue `EVFILT_VNODE` on a descriptor opened `O_EVTONLY` for every
-  file and directory, since a directory tells that its entries changed but
-  not which, and a file's writes only reach its own descriptor.
+- macOS: an FSEventStream per directory target, which covers the whole
+  tree beneath it, so nothing is opened per file, and a file target is
+  covered by the stream of its directory. A target below a stream already
+  watching its tree needs no stream of its own, which keeps a watch of a
+  directory that isn't recursive at one stream. The stream names what
+  changed (`kFSEventStreamCreateFlagFileEvents`) and hears of the root
+  itself (`kFSEventStreamCreateFlagWatchRoot`), delivering through one
+  callback created at startup, on one serial dispatch queue of the
+  process, never the main thread. `Subtree` targets report paths at any
+  depth; one without it drops what changes deeper than its entries. The
+  stream's path is resolved with `realpath`, as FSEvents names what is
+  on disk, which a path given on a case-insensitive volume may not. The
+  notices are hints: `MustScanSubDirs` or a full queue makes the core look
+  at everything again, as an overflow does elsewhere, and the stream's
+  10 ms latency is under the core's debounce, which does the coalescing an
+  app sees. The stream starts `SinceNow`, but fseventsd can report a
+  change made just before it started; the core's snapshot is taken as
+  targets are enrolled, so nothing comes of it.
 - Linux: one inotify instance for the process, as fsnotify, with a watch
   per directory, which names the child that changed: watches cost watch
   descriptors, not instances, of which many systems allow 128 per user
@@ -1671,8 +1714,10 @@ main thread, so watches work before the app runs and don't wait on it.
   out junctions and mount points but not the placeholders of cloud files
   (OneDrive), reparse points that are no name surrogates.
 
-Backends report a write (`FileWatchWrite`) only for content: kqueue's
-`NOTE_WRITE` and `NOTE_EXTEND`, inotify's `IN_MODIFY` and `IN_CLOSE_WRITE`,
+Backends report a write (`FileWatchWrite`) only for content: FSEvents'
+`ItemModified` on a file (its `ItemCreated`, which APFS also sets on an
+`O_TRUNC` write, stays dirty and lets the core's comparison report the
+change), inotify's `IN_MODIFY` and `IN_CLOSE_WRITE`,
 and Windows without `FILE_NOTIFY_CHANGE_ATTRIBUTES`. Attribute changes are
 dirty, and the core compares only size and modification time, so that
 indexers and antivirus touching metadata report nothing.
@@ -1684,7 +1729,10 @@ bookkeeping and SwiftUI's 2026 `Document` for the shape (a snapshot on the
 main thread, the I/O on goroutines), with the recovery copies of VS Code
 and Zed. Everything is in the core; backends only show a window's
 document (`Window.SetRepresentedFile`, `SetDocumentEdited`) and replace
-files (`Backend.ReplaceFile`).
+files (`Backend.ReplaceFile`). The menus reach documents only through the
+functions the first kind registers (`linkedDocuments`), so that apps
+without documents do not link them through the File menu's roles and Open
+Recent (about 290 KB).
 
 - *State.* `Document[T]` embeds `docBase`, the state that doesn't depend on
   the content's type, under one mutex: a change counter (`changes`), the
@@ -1715,8 +1763,8 @@ files (`Backend.ReplaceFile`).
   (in conflict when the file's stamp changed), writes them into its own
   session, then removes the old ones.
 - *Watches.* One `WatchFiles` per file of open documents, shared by
-  reference count, which costs the same whatever else its folder holds
-  (kqueue takes a descriptor per file a folder's watch covers); a batch
+  reference count, which costs the same whatever else its folder holds: a
+  watch covers the folder, not each file in it. A batch
   makes the document look at the disk (`checkDisk`), as focusing its
   window does, and so does the watch once it started. A removal looks in
   the folder for the file's identity, to follow a rename.
@@ -1752,15 +1800,24 @@ identity without depending on construction order; focus requests wait for a
 hidden control. `Services` offers persistent clipboard, URL and redraw access.
 
 Constructors build and style controls eagerly. `Context.Key` supplies an ID
-before state initialization. `Changed` and `Submitted` apply pending input
-to controls built so far, once per pass, before returning the response. This
-lets polling commit a local bound value immediately. Input options must be
-configured before response queries. Public click and shortcut queries also
-apply pending bound input before returning, so inline actions see the latest
-edits. `ComboboxParts.Chosen` applies input and reports a choice in the same
-pass; it is not carried into a later rebuild. Private widget queries do not
-finalize input during construction, before fluent configuration. Remaining
-input applies after construction. `OnChange` and `OnSubmit` run after construction and bound
+before state initialization. A control takes its input as the public
+constructor that built it returns, as Dear ImGui's widgets do, so what it
+binds, a local copy too, holds the edit when the next statement reads it
+(`value_input.go`). The generated facade brackets each constructor with
+`beginBuild` and `endBuild`; a control's queued input records how many
+constructors were under way, and `endBuild` finalizes the input queued
+deeper than the constructors still under way: a container's (a radio
+group's arrow keys) waits aside until the call that built its children
+returns, and each entry is visited once. Input queued outside public
+constructors, by the engine's own controls, is finished at once, and what
+remains applies after construction. Input follows the options of the build
+the user acted on: a constructor resets its fluent options (`ReadOnly`,
+`OnPaste`, a slider's `Step`) for this build after keeping the last build's,
+which edits apply by (`editor.withShown`, `sliderSettings.shown`), and the
+retained `flagDisabled` is last build's. `Changed`, `Submitted`, click and
+shortcut queries apply finished input before answering.
+`ComboboxParts.Chosen` applies input and reports a choice in the same
+pass; it is not carried into a later rebuild. `OnChange` and `OnSubmit` run after construction and bound
 input, before rebuilding. Notices are cleared before another pass so an
 edit cannot be reported again on a fresh local binding. Callback actions
 consume input once and rebuild before paint.
@@ -3591,6 +3648,58 @@ canvases and pixelated sprites.
 Benchmarks are described on the page by their doc comments, which the
 site reads when it is built: start them with the benchmark's name.
 
+### Binary size
+
+Go's linker keeps what `main` can reach: a function called from anywhere
+reachable, every method of `platform.Backend` and of the other interfaces
+a backend is used through, and the data those touch (a table read on
+first use is linked whole). So a feature costs every app as soon as
+something every app runs calls it, even on a path that never runs. The
+rules, which took counter-native back to 8.9 MB after it had grown from
+10.8 MB to 12.2 MB:
+
+- *Opt-in features hang off their constructor.* What every app reaches
+  (`App.Run`, `NewWindow`, the default menus and their roles, `init`
+  functions, locale resolution) calls an opt-in feature only through
+  functions the feature registers when the app first uses it: the File
+  menu's document roles and Open Recent call `linkedDocuments`, which the
+  first `NewDocuments` fills; `App.Run` writes the TypeScript client
+  through what `Bind` and `NewEvent` register; messages format dates
+  through what `i18n.NewCatalog` registers. Generic constructors are only
+  linked when instantiated, so they are a good place to register.
+- *No reflective method lookups on shared paths.* A reachable call of
+  `reflect.Type.Method`, `reflect.Value.Method` or `MethodByName` with a
+  name the compiler cannot see makes the linker keep every exported method
+  of every type used through an interface: 2.5 MB of counter-native. Only
+  `Bind`, `BindAs` and plugins with a service do it; MyGo's own services
+  use `bindFuncs`. `text/template` and `html/template` do it too.
+- *Backends stay thin.* Every method of `platform.Backend` and its
+  controllers is linked into every app of that platform, used or not, so
+  they translate calls and keep policy, parsing and data in the core or
+  the feature's package.
+- *Heavy packages and data stay where they are needed*: in a subpackage
+  or a plugin (`ui/editor`, `ui/markdown`, `plugins/watch`) rather than in
+  `mygo` or `ui`, and out of `init`. Importing net/http alone adds 2.3 MB.
+  Data read on first use is linked whole, so split a table that a shared
+  path reads in part, as CLDR's numbers and dates are; embed what the
+  running app reads, not what tools read (`internal/l10n` embeds its
+  messages without their descriptions).
+
+To check a change, build both apps as the benchmarks do, before and
+after, on each platform it touches:
+
+```sh
+go build -trimpath -tags mygo_noinspector -ldflags "-s -w -X github.com/egoist/mygo.production=1" -o /tmp/counter-native ./examples/counter-native
+GOOS=windows go build -trimpath -tags mygo_noinspector -ldflags "-s -w -H=windowsgui -X github.com/egoist/mygo.production=1" -o /tmp/hello.exe ./examples/hello
+```
+
+When an app grows, `go tool nm -size -sort size` on a build without `-s
+-w` shows which symbols grew, and `go build -ldflags=-dumpdep ... 2>
+deps.txt` prints every edge `a -> b` of the linker's walk: follow the
+first edge to a symbol back to `main.main` to see why it is there, and
+search for `<ReflectMethod>`, which marks a reflective lookup that keeps
+every method.
+
 ## Releasing
 
 The Go module, the CLI and the npm packages share one version:
@@ -3657,11 +3766,13 @@ which npm allows only for packages that exist: the first release uses an
 5. **Test**: unit test through `internal/fake`, a GUI test in `internal/e2e`
    when behavior depends on the toolkit, and run the Linux GUI tests in the
    container.
-6. **If the page runtime changes**, edit `packages/bridge` or
+6. **Keep apps that don't use it the same size** (see "Binary size"):
+   build `examples/counter-native` and `examples/hello` before and after.
+7. **If the page runtime changes**, edit `packages/bridge` or
    `packages/runtime`, run `bun run test`, `bun run typecheck` and
    `bun run build`, and commit `internal/bridge/bridge.js`. If the generated client changes, update
    `internal/tsgen/generate.go` and its tests.
-7. **Document** the behavior in the Go doc comments and platform
+8. **Document** the behavior in the Go doc comments and platform
    differences in the README.
 
 <!-- repository-only:end -->
@@ -3670,7 +3781,7 @@ which npm allows only for packages that exist: the first release uses an
 
 | feature | macOS | Linux | Windows |
 |---|---|---|---|
-| watching files | kqueue, a descriptor per file and directory | inotify, per directory | `ReadDirectoryChangesW`, one for a recursive tree, and the parent to see the directory renamed |
+| watching files | FSEvents, one stream per tree, no descriptor per file | inotify, per directory | `ReadDirectoryChangesW`, one for a recursive tree, and the parent to see the directory renamed |
 | menu bar | application menu bar, default menu installed | per-window GTK menu bar, none by default | per-window Win32 menu bar, none by default |
 | auto-hide menu bar | ignored | the bar widget hides; `can-activate-accel` keeps its shortcuts; Alt alone or F10 show it and open its first menu until it deactivates | the menu is attached only for the `SC_KEYMENU` menu loop that Alt alone or F10 start; shortcuts come from the webview |
 | tray | NSStatusItem, click events | AppIndicator (menu only, no click events) | notification area icon, click events |

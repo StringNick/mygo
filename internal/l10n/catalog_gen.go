@@ -4,12 +4,18 @@ package l10n
 
 import (
 	"embed"
+	"io/fs"
 
 	"github.com/egoist/mygo/i18n"
+	"github.com/egoist/mygo/internal/i18nlink"
 )
 
-//go:embed *.json
-var files embed.FS
+// messages holds messages/en.json, the messages of en without their
+// descriptions, which go generate writes for the catalog: every app carries
+// it.
+//
+//go:embed messages/*.json
+var messages embed.FS
 
 // Catalog holds the messages in en, the source language, and those of the
 // translations added to it (Catalog.Add). Apps change them, or translate
@@ -17,10 +23,15 @@ var files embed.FS
 var Catalog *i18n.Catalog
 
 func init() {
-	var err error
-	if Catalog, err = i18n.NewLibraryCatalog(files, "en", "mygo"); err != nil {
+	files, err := fs.Sub(messages, "messages")
+	if err != nil {
 		panic(err)
 	}
+	c, err := i18nlink.NewLibraryCatalog(files, "en", "mygo")
+	if err != nil {
+		panic(err)
+	}
+	Catalog = c.(*i18n.Catalog)
 }
 
 // Messages say the messages in one language.
@@ -2605,4 +2616,64 @@ func ClearScrollback() string { return In(i18n.Locale()).ClearScrollback() }
 // view.
 func (msgs Messages) ClearScrollback() string {
 	return Catalog.Format(msgs.locale, "clearScrollback", nil)
+}
+
+// ClipboardRead says "A program wants to read the clipboard"
+// in the language the app shows.
+//
+// The title of the terminal's prompt about a program's read of the
+// clipboard.
+func ClipboardRead() string { return In(i18n.Locale()).ClipboardRead() }
+
+// ClipboardRead says "A program wants to read the clipboard"
+// in the language of msgs.
+//
+// The title of the terminal's prompt about a program's read of the
+// clipboard.
+func (msgs Messages) ClipboardRead() string {
+	return Catalog.Format(msgs.locale, "clipboardRead", nil)
+}
+
+// ClipboardReadAllow says "Allow"
+// in the language the app shows.
+//
+// The button of the terminal's clipboard prompt that lets the program read.
+func ClipboardReadAllow() string { return In(i18n.Locale()).ClipboardReadAllow() }
+
+// ClipboardReadAllow says "Allow"
+// in the language of msgs.
+//
+// The button of the terminal's clipboard prompt that lets the program read.
+func (msgs Messages) ClipboardReadAllow() string {
+	return Catalog.Format(msgs.locale, "clipboardReadAllow", nil)
+}
+
+// ClipboardReadDeny says "Deny"
+// in the language the app shows.
+//
+// The button of the terminal's clipboard prompt that refuses the program.
+func ClipboardReadDeny() string { return In(i18n.Locale()).ClipboardReadDeny() }
+
+// ClipboardReadDeny says "Deny"
+// in the language of msgs.
+//
+// The button of the terminal's clipboard prompt that refuses the program.
+func (msgs Messages) ClipboardReadDeny() string {
+	return Catalog.Format(msgs.locale, "clipboardReadDeny", nil)
+}
+
+// ClipboardReadEmpty says "The clipboard is empty."
+// in the language the app shows.
+//
+// What the terminal's clipboard prompt shows when the clipboard holds no
+// text.
+func ClipboardReadEmpty() string { return In(i18n.Locale()).ClipboardReadEmpty() }
+
+// ClipboardReadEmpty says "The clipboard is empty."
+// in the language of msgs.
+//
+// What the terminal's clipboard prompt shows when the clipboard holds no
+// text.
+func (msgs Messages) ClipboardReadEmpty() string {
+	return Catalog.Format(msgs.locale, "clipboardReadEmpty", nil)
 }
