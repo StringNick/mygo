@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sync"
 	"testing"
 	"time"
 	"unsafe"
@@ -548,6 +549,49 @@ func TestSplitsDrawTheSamePixels(t *testing.T) {
 	r.b.NoRingSplit, r.b.NoShadowSplit = false, false
 }
 
+// holdPipelineBuilds blocks specialized compilation, including an accidental
+// synchronous build in pipeFor. The watchdog only breaks a deadlock: a passing
+// test must finish its frame while the gate remains closed. A separate startup
+// deadline also catches a worker that never enters a build.
+func holdPipelineBuilds(t *testing.T, r *Renderer) (waitStarted, resume func()) {
+	t.Helper()
+	started, gate, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var entered, released sync.Once
+	unblock := func() { released.Do(func() { close(gate) }) }
+	r.pipes.beforeBuild = func() {
+		entered.Do(func() { close(started) })
+		<-gate
+	}
+	go func() {
+		defer close(done)
+		timer := time.NewTimer(30 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-gate:
+			return
+		case <-started:
+			timer.Reset(30 * time.Second)
+		case <-timer.C:
+			t.Error("the pipeline worker did not start a build")
+			unblock()
+			return
+		}
+		select {
+		case <-gate:
+		case <-timer.C:
+			t.Error("the frame or Release waited for the blocked pipeline compile")
+			unblock()
+		}
+	}()
+	return func() {
+		select {
+		case <-started:
+		case <-done:
+			t.Fatal("no blocked pipeline build to test")
+		}
+	}, func() { unblock(); <-done }
+}
+
 // TestFramesNeverWaitForACompile checks that a frame whose batches need a
 // specialized pipeline that is not made yet draws with the general one at
 // once, whatever the compile takes, that the worker then makes it and later
@@ -568,27 +612,27 @@ func TestFramesNeverWaitForACompile(t *testing.T) {
 		unavailable(t, err)
 	}
 	defer r.Release()
-	// Slow enough that a frame waiting for it would show.
-	delay := 250 * time.Millisecond
-	r.pipes.delay = delay
+	waitStarted, resume := holdPipelineBuilds(t, r)
+	defer resume() // unblock the worker before Release, including on a failed test
 	s := gputest.OpaqueScene(900, 700)
-	var first, second []byte
-	t0 := time.Now()
-	first = renderRaw(t, r, s, false)
-	if d := time.Since(t0); d > delay/2 {
-		t.Fatalf("the first frame took %v: it waited for a compile of %v", d, delay)
+	first := renderRaw(t, r, s, false)
+	waitStarted()
+	if built, failed := r.pipelineCounts(); built != 0 || failed != 0 {
+		t.Fatalf("the first frame completed after compiling pipelines: built=%d failed=%d", built, failed)
+	}
+	if r.pipes.fallbacks == 0 {
+		t.Fatal("the first frame did not draw with a general fallback")
 	}
 	f := r.cur
 	if p := r.pipeFor(f, gpu.ClassGlyph, true, blendOver); p != f.pipeline {
 		t.Error("a pipeline that is not made yet is not the general one")
 	}
-	// The worker makes them, one after the other; wait for the plain fill's.
+	// The frame finished while compilation was held. Let the worker make
+	// the pipelines, one after the other, and wait for the plain fill's.
+	resume()
 	plain := f.pipeline
 	for i := 0; i < 200 && plain == f.pipeline; i++ {
 		time.Sleep(50 * time.Millisecond)
-		r.pipes.mu.Lock()
-		r.pipes.delay = 0
-		r.pipes.mu.Unlock()
 		plain = r.pipeFor(f, gpu.ClassPlain, false, blendOver)
 		if plain == 0 {
 			t.Fatal("no pipeline")
@@ -600,7 +644,7 @@ func TestFramesNeverWaitForACompile(t *testing.T) {
 	if plain == f.pipeline {
 		t.Fatal("the worker did not make the specialized pipeline")
 	}
-	second = renderRaw(t, r, s, false)
+	second := renderRaw(t, r, s, false)
 	if d := differing(first, second); d != 0 {
 		t.Errorf("%d bytes differ between the frame drawn with the general pipelines and with the specialized ones", d)
 	}
@@ -916,15 +960,44 @@ func TestReleaseStopsQueuedPipelineCompiles(t *testing.T) {
 		unavailable(t, err)
 	}
 	defer r.Release()
-	r.pipes.delay = 250 * time.Millisecond
+	waitStarted, resume := holdPipelineBuilds(t, r)
+	defer resume()
 	renderRaw(t, r, gputest.Scene(), false)
+	waitStarted()
 	r.pipes.mu.Lock()
 	pending, before := len(r.pipes.work), r.pipes.nbuilt
 	r.pipes.mu.Unlock()
 	if pending < 2 {
 		t.Fatalf("need queued warmup work, got %d", pending)
 	}
+	// Release must close the queue before waiting for the active build. Let
+	// that build finish only after observing the closed state.
+	unblocked := make(chan struct{})
+	go func() {
+		defer close(unblocked)
+		timer := time.NewTimer(30 * time.Second)
+		defer timer.Stop()
+		tick := time.NewTicker(time.Millisecond)
+		defer tick.Stop()
+		for {
+			r.pipes.mu.Lock()
+			closed := r.pipes.closed
+			r.pipes.mu.Unlock()
+			if closed {
+				resume()
+				return
+			}
+			select {
+			case <-tick.C:
+			case <-timer.C:
+				t.Error("Release did not close the pipeline queue")
+				resume()
+				return
+			}
+		}
+	}()
 	r.Release()
+	<-unblocked
 	after, failed := r.pipelineCounts()
 	if after-before > 1 {
 		t.Fatalf("Release built %d queued pipelines; only an active compile may finish", after-before)

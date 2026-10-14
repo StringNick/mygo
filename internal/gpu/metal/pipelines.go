@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/egoist/mygo/internal/gpu"
 )
@@ -52,12 +51,13 @@ type pipeState struct {
 	work    chan pipeKey
 	wg      sync.WaitGroup
 	closed  bool
-	sync    bool          // build in pipeFor, see syncPipelines
-	delay   time.Duration // for tests: how long the worker waits before it builds one
-	warmed  [2]bool       // by format
-	owned   []id          // pipelines of renderers that do not use the cache
-	nbuilt  int           // pipelines the worker made, for tests
+	sync    bool    // build in pipeFor, see syncPipelines
+	warmed  [2]bool // by format
+	owned   []id    // pipelines of renderers that do not use the cache
+	nbuilt  int     // pipelines the worker made, for tests
 	nfailed int
+
+	beforeBuild func() // test hook, set before the first frame starts the worker
 	// fallbacks counts the batches of the frame being encoded that drew with
 	// the general pipeline because the specialized one was not made yet
 	// (touched by the encoding goroutine only).
@@ -147,13 +147,10 @@ func (r *Renderer) pipelineWorker() {
 	defer r.pipes.wg.Done()
 	for k := range r.pipes.work {
 		r.pipes.mu.Lock()
-		d, closed := r.pipes.delay, r.pipes.closed
+		closed := r.pipes.closed
 		r.pipes.mu.Unlock()
 		if closed {
 			return // Release waits for the active compile, not the warmup backlog.
-		}
-		if d > 0 {
-			time.Sleep(d)
 		}
 		pool(func() { r.buildPipeline(k) })
 	}
@@ -163,6 +160,9 @@ func (r *Renderer) pipelineWorker() {
 // and publishes it.
 func (r *Renderer) buildPipeline(k pipeKey) {
 	p := &r.pipes
+	if p.beforeBuild != nil {
+		p.beforeBuild()
+	}
 	dk := deviceKey{r.device, k}
 	cacheable := r.source == ""
 	var pipe id
