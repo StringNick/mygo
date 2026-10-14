@@ -374,3 +374,45 @@ func TestCullKeepsTransformedShadows(t *testing.T) {
 		}
 	}
 }
+
+// TestFillsInsideTheirClipSkipItsCoverage checks which fills the builder
+// tells the shaders need no clip coverage: those not transformed whose quad
+// lies well inside a clip that is a plain rectangle.
+func TestFillsInsideTheirClipSkipItsCoverage(t *testing.T) {
+	s := &scene.Scene{Width: 200, Height: 200}
+	fill := func(r scene.Rect) {
+		s.Ops = append(s.Ops, scene.Op{Kind: scene.OpFill, Rect: r, Color: scene.Color{A: 255}})
+	}
+	fill(scene.Rect{X: 10, Y: 10, W: 50, H: 50}) // 0: inside the root clip
+	fill(scene.Rect{X: 0, Y: 0, W: 200, H: 200}) // 1: the frame
+	s.Ops = append(s.Ops, scene.Op{Kind: scene.OpPushClip, Rect: scene.Rect{X: 20, Y: 20, W: 100, H: 100}})
+	fill(scene.Rect{X: 40, Y: 40, W: 20, H: 20}) // 2: inside the clip
+	fill(scene.Rect{X: 19, Y: 40, W: 20, H: 20}) // 3: cut by it
+	fill(scene.Rect{X: 21, Y: 40, W: 20, H: 20}) // 4: a pixel from its edge, within the antialiasing's reach
+	s.Ops = append(s.Ops, scene.Op{Kind: scene.OpPopClip})
+	s.Ops = append(s.Ops, scene.Op{Kind: scene.OpPushClip, Rect: scene.Rect{X: 20, Y: 20, W: 100, H: 100}, Radii: [4]float32{8, 8, 8, 8}})
+	fill(scene.Rect{X: 50, Y: 50, W: 10, H: 10}) // 5: under a rounded clip
+	s.Ops = append(s.Ops, scene.Op{Kind: scene.OpPopClip})
+	s.Ops = append(s.Ops, scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 10, Y: 10, W: 50, H: 50}, Color: scene.Color{A: 255}, Transform: scene.Translation(3, 3)}) // 6
+	want := map[int]bool{0: true, 1: true, 2: true}                                                                                                                   // 1, the frame, lies in the root clip, which is unbounded
+	tex := func(*scene.Image) uintptr { return 1 }
+	var b Builder
+	b.NoCull = true
+	b.ClipSkip = true
+	b.Build(s, tex)
+	if len(b.Instances) != 7 {
+		t.Fatalf("%d instances", len(b.Instances))
+	}
+	for k, in := range b.Instances {
+		if got := in.Transform1[3] == 3; got != want[k] {
+			t.Errorf("fill %d: no clip coverage is %v, want %v", k, got, want[k])
+		}
+	}
+	b.NoClipSkip = true
+	b.Build(s, tex)
+	for k, in := range b.Instances {
+		if in.Transform1[3] == 3 {
+			t.Errorf("instance %d skips the clip with NoClipSkip", k)
+		}
+	}
+}

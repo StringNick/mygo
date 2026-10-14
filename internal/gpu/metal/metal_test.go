@@ -377,7 +377,7 @@ func TestRingSplitDrawsTheSamePixels(t *testing.T) {
 // scenes of fills and opaque fills at window sizes, the reference scene and
 // the scenes of transformed content.
 func identityCases() []gputest.CullCase {
-	cases := []gputest.CullCase{{Name: "reference scene", Scene: gputest.Scene()}, {Name: "transformed scene", Scene: gputest.TransformedScene()},
+	cases := []gputest.CullCase{{Name: "window fills", Scene: gputest.FillScene(3456, 2000)}, {Name: "odd window fills", Scene: gputest.FillScene(2049, 1031)}, {Name: "reference scene", Scene: gputest.Scene()}, {Name: "transformed scene", Scene: gputest.TransformedScene()},
 		{Name: "perspective scene", Scene: gputest.PerspectiveScene()}, {Name: "axis clip scene", Scene: gputest.AxisClipScene()},
 		{Name: "continuous scene", Scene: gputest.ContinuousScene()}}
 	cases = append(cases, gputest.CullCases()...)
@@ -492,4 +492,55 @@ func TestCullTransformedShadows(t *testing.T) {
 	if r.b.Culled != 1 {
 		t.Errorf("a full-frame cover culled %d ops, want 1", r.b.Culled)
 	}
+}
+
+// TestFastFillDrawsTheSamePixels draws scenes of plain fills along the
+// shader's fast path (and with the clip's coverage skipped where the builder
+// found it to be 1) and along its general path, in BGRA8 and float16
+// targets, at the size of a window of a retina display too, and requires the
+// same bytes.
+func TestFastFillDrawsTheSamePixels(t *testing.T) {
+	r, err := newRenderer()
+	if err != nil {
+		unavailable(t, err)
+	}
+	defer r.Release()
+	cases := []gputest.CullCase{{Name: "reference scene", Scene: gputest.Scene()}, {Name: "small fills", Scene: gputest.FillScene(900, 700)},
+		{Name: "window fills", Scene: gputest.FillScene(3456, 2000)}, {Name: "odd window fills", Scene: gputest.FillScene(2049, 1031)}}
+	for _, c := range gputest.CullCases() {
+		cases = append(cases, c)
+	}
+	for _, wide := range []bool{false, true} {
+		if wide && !r.SetWide(true) {
+			t.Log("no wide target:", r.wideErr)
+			continue
+		}
+		for _, c := range cases {
+			r.b.GeneralFill, r.b.NoClipSkip = false, false
+			fast := renderRaw(t, r, c.Scene, wide)
+			plain, unclipped := 0, 0
+			for _, in := range r.b.Instances {
+				if in.Params[0] == 0 && in.Params[2] == 0 && in.UV == [4]float32{} {
+					plain++
+				}
+				if in.Transform1[3] == 3 {
+					unclipped++
+				}
+			}
+			r.b.GeneralFill, r.b.NoClipSkip = true, true
+			general := renderRaw(t, r, c.Scene, wide)
+			if c.Name == "window fills" && (plain == 0 || unclipped == 0) {
+				t.Errorf("%s: %d plain fills, %d without clip coverage", c.Name, plain, unclipped)
+			}
+			for _, in := range r.b.Instances {
+				if in.Params[0] == 0 && in.Transform1[3] == 3 {
+					t.Fatalf("%s: a fill without clip coverage along the general path", c.Name)
+				}
+			}
+			if d := differing(fast, general); d != 0 {
+				t.Errorf("%s wide=%v: %d bytes differ between the fast and the general path", c.Name, wide, d)
+			}
+		}
+	}
+	r.b.GeneralFill, r.b.NoClipSkip = false, false
 }

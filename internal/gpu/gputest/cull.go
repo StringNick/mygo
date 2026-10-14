@@ -204,3 +204,43 @@ func CullCases() []CullCase {
 	cs("nested panels", b, 18)
 	return out
 }
+
+// FillScene returns a w×h scene of plain fills, the kind most of a window
+// is made of: layers as large as the frame, panels with square and round
+// corners at fractional places, rows in a clip that holds some whole and
+// cuts others, fills of every opacity, a gradient, a border and a transformed
+// fill among them, over the clear color. Sizes at or above 2048 pixels take
+// the interpolated coordinates across binades of float32.
+func FillScene(w, h int) *scene.Scene {
+	s := &scene.Scene{Width: w, Height: h, Clear: scene.Color{R: 12, G: 10, B: 9, A: 255}}
+	fw, fh := float32(w), float32(h)
+	r4 := func(r float32) [4]float32 { return [4]float32{r, r, r, r} }
+	add := func(op scene.Op) { s.Ops = append(s.Ops, op) }
+	shade := func(i int) scene.Color {
+		return scene.Color{R: byte(20 + i*37%200), G: byte(10 + i*53%220), B: byte(40 + i*71%200), A: 255}
+	}
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{W: fw, H: fh}, Color: shade(1)})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: fw / 6, Y: 16.25, W: fw * 2 / 3, H: fh - 40.5}, Radii: r4(24), Color: shade(2)})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: fw/6 + 2, Y: 154, W: fw*2/3 - 4, H: fh - 190}, Color: shade(3)})
+	// Rows in a clip: some inside it, one cut at each end.
+	cx, cy, cw, ch := fw/6+2, float32(154), fw*2/3-4, fh-190
+	add(scene.Op{Kind: scene.OpPushClip, Rect: scene.Rect{X: cx + 10.5, Y: cy + 20.25, W: cw - 21, H: ch - 40}})
+	for i := range 40 {
+		y := cy + 10 + float32(i)*(ch-20)/40
+		add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: cx + 5.5, Y: y, W: cw - 11, H: (ch-20)/40 - 1.5}, Color: shade(i + 4)})
+		add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: cx + 30, Y: y + 2, W: cw / 3, H: 6.5}, Radii: r4(3), Color: shade(i + 9), Opacity: 0.5 + float32(i%3)/6})
+	}
+	add(scene.Op{Kind: scene.OpPopClip})
+	// A rounded clip, and an op touching its edge.
+	add(scene.Op{Kind: scene.OpPushClip, Rect: scene.Rect{X: cx + 40, Y: cy + 40, W: 300, H: 200}, Radii: r4(20)})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: cx + 30, Y: cy + 100, W: 400, H: 60}, Color: shade(50)})
+	add(scene.Op{Kind: scene.OpPopClip})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: cx + 400, Y: cy + 30, W: 200, H: 80}, Color: shade(60), Color2: shade(61), Paint: scene.PaintLinear, Gradient: [4]float32{cx + 400, 0, cx + 600, 0}})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: cx + 400, Y: cy + 130, W: 200, H: 80}, Radii: r4(12), Color: shade(62), Border: scene.Uniform(2), BorderColor: shade(63)})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: cx + 400, Y: cy + 230, W: 200, H: 80}, Color: shade(64), Transform: scene.Scaling(1.01, 1)})
+	// The edges of the frame: fills reaching and passing it.
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: -5, Y: fh - 30, W: fw + 10, H: 30}, Color: shade(70)})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: fw - 20, Y: 0, W: 20, H: fh}, Color: shade(71), Opacity: 0.4})
+	add(scene.Op{Kind: scene.OpFill, Rect: scene.Rect{X: 0, Y: 0, W: fw, H: 1.5}, Color: shade(72)})
+	return s
+}

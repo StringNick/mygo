@@ -85,7 +85,11 @@ type Instance struct {
 	// backdrop averages; and the opacity.
 	Params [4]float32
 	// Transform rows map local pixels to the frame. Transform0.w enables
-	// transformed antialiasing, Transform1.w selects a cached clip mask.
+	// transformed antialiasing, Transform1.w selects how the clip applies: 0
+	// the clip rectangle cut by the shader, 1 a cached clip mask, 2 a hard
+	// clip over a masked one, and 3 none, as the builder found the clip's
+	// rectangle to hold the whole quad with room for the antialiasing (see
+	// markFill): the shaders then skip computing it.
 	// Transform2 holds the projective row's g and h, the frame point of
 	// local (x, y) being Transform0's and Transform1's dot products with
 	// (x, y, 1) over g*x + h*y + 1: shaders interpolate in perspective.
@@ -140,6 +144,12 @@ type Builder struct {
 	// NoCull draws every op, even those that later opaque fills cover whole
 	// (see planCull), for tests that compare the two.
 	NoCull bool
+	// GeneralFill makes the shaders take their general path for every fill,
+	// and NoClipSkip makes them compute the clip's coverage where it is 1
+	// (see markFill), for tests and measurements that compare them.
+	GeneralFill, NoClipSkip bool
+	// ClipSkip enables the clip-coverage flag understood by the Metal shader.
+	ClipSkip bool
 	// Culled is how many ops the last Build left out as covered.
 	Culled       int
 	culled       []bool
@@ -452,6 +462,9 @@ func (b *Builder) add(in Instance, image uintptr, m scene.Affine) {
 	if !b.prepare(&in, m, cur) {
 		return
 	}
+	if in.Params[0] == 0 {
+		b.markFill(&in, m, cur)
+	}
 	n := len(b.Batches)
 	sc := b.batchScissor(cur)
 	if n == 0 || b.Batches[n-1].Scissor != sc || b.Batches[n-1].Effect != nil || b.Batches[n-1].Hole ||
@@ -464,6 +477,36 @@ func (b *Builder) add(in Instance, image uintptr, m scene.Affine) {
 	}
 	b.Instances = append(b.Instances, in)
 	b.Batches[n-1].Count++
+}
+
+// plainFill is the shaders' second path for fills, for most of the ones a
+// window draws: solid, not transformed and without a border. They then
+// compute no gradient, border, dash or transform, which the general path
+// does for any kind of fill, and for none the same value (the pixels are
+// identical). Instances tell by their fields, as the shaders test them (an
+// unset transform, solid paint, no border widths).
+//
+// markFill sets, for fills not transformed within a clip that is a plain
+// rectangle holding the whole quad (with room for the antialiasing around
+// it), Transform1.w to 3: the clip then covers every fragment by 1, and the
+// shaders skip computing it. With GeneralFill it makes a plain fill take the
+// general path, by giving it a border width of a hair, which with a
+// transparent border color leaves the pixels as they were.
+func (b *Builder) markFill(in *Instance, m scene.Affine, cur *clip) {
+	if m.Set {
+		return
+	}
+	if b.GeneralFill && in.Params[2] == float32(scene.PaintSolid) && in.UV == [4]float32{} {
+		in.UV = [4]float32{1e-6, 0, 0, 0}
+	}
+	if !b.ClipSkip || b.NoClipSkip || in.Transform1[3] != 0 || cur.masked || cur.radii != [4]float32{} {
+		return
+	}
+	c, r := cur.rect, scene.Rect{X: in.Rect[0], Y: in.Rect[1], W: in.Rect[2], H: in.Rect[3]}
+	const room = 3 // the quad's pixel of antialiasing, and a pixel's reach
+	if c.X <= r.X-room && c.Y <= r.Y-room && c.X+c.W >= r.X+r.W+room && c.Y+c.H >= r.Y+r.H+room {
+		in.Transform1[3] = 3
+	}
 }
 
 // shadowSplitMin is the area, in pixels, below which a shadow is not split

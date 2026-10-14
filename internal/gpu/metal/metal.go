@@ -369,10 +369,10 @@ type Renderer struct {
 	synced, holes, waited, behind bool
 	skippedAt                     time.Time
 
-	mask    texture
-	color   texture
-	empty   id // a texture to bind where there is none
-	images  map[uint64]*texture
+	mask   texture
+	color  texture
+	empty  id // a texture to bind where there is none
+	images map[uint64]*texture
 	// canvases are the textures canvases are drawn into.
 	canvases map[uint64]*canvasTexture
 	frame    uint64
@@ -877,6 +877,7 @@ func (r *Renderer) drawCanvas(cb id, c *scene.Image) error {
 
 // drawInto encodes drawing s into target with d, in the format r.cur is.
 func (r *Renderer) drawInto(cb id, s *scene.Scene, target id, d *drawState) error {
+	d.b.ClipSkip = true
 	s = d.b.Build(s, r.imageTexture)
 	if n := len(d.b.Instances); n > d.instCap {
 		release(&d.instBuf)
