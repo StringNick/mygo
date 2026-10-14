@@ -3082,17 +3082,18 @@ either.
     them (`presentDrawable:`), sparing a pass of AppKit's display cycle
     and a commit of the transaction each: an animation at 120 Hz takes
     about half the main thread's time it would. A frame presented so
-    that waited for its drawable, as the display held the available drawables until its next
-    refresh, has the next skip a refresh (`Behind`, at most once a
-    second), or the frames after would wait as long, most of each
+    that waited for its drawable, as the display held the others until
+    its next refresh, has the next skip a refresh (`Behind`, at most
+    once a second), or the frames after would wait as long, most of each
     refresh, blocking the main thread. Each frame waits for the GPU to
     finish the last before it updates the textures and the instance
-    buffer the last read. The layer allows three drawables so a frame can
-    acquire a spare while Core Animation holds the presented frames,
-    reducing main-thread waits at high refresh rates. This retains one
-    more frame of memory while animating than a two-drawable pool. Two
-    seconds after the last frame, as the driver frees its own memory of
-    frames, a timer shrinks the drawables,
+    buffer the last read, yet the layer keeps three drawables, as Core
+    Animation makes while a window animates: with two, on a ProMotion
+    display, frames waited for one most of each refresh, a skip catching
+    up for a few frames only, and a fifth of the frames went undrawn. The
+    third costs a frame of memory while a window animates. Two seconds
+    after the last frame, as the driver frees its own memory of frames,
+    a timer shrinks the drawables,
     which frees all but the one shown, until the next frame makes them
     again, and releases GPU instance buffers, atlas/image textures and
     backdrop textures: an idle window keeps one frame of memory. Its
