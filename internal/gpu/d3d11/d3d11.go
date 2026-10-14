@@ -1046,7 +1046,4 @@ func (r *Renderer) present(sync uintptr) error {
 }
 
 // FrameInfo describes the last frame for MYGO_FRAME_STATS.
-func (r *Renderer) FrameInfo() string {
-	info := r.b.Summary()
-	return info
-}
+func (r *Renderer) FrameInfo() string { return r.b.Summary() }
